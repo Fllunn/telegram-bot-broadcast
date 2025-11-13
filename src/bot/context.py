@@ -7,7 +7,7 @@ from src.db.repositories.user_repository import UserRepository
 from src.services.auth_state import AuthStateManager
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.broadcast_state import BroadcastStateManager
-from src.services.groups_state import GroupUploadStateManager
+from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
 
 
 @dataclass(slots=True)
@@ -20,3 +20,4 @@ class BotContext:
     auth_manager: AuthStateManager
     broadcast_manager: BroadcastStateManager
     groups_manager: GroupUploadStateManager
+    group_view_manager: GroupViewStateManager
