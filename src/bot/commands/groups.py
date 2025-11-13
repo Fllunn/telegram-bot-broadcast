@@ -57,6 +57,59 @@ class ParsedGroup:
     link: Optional[str]
 
 
+_USERNAME_TOKEN = re.compile(r"^(?:[A-Za-z0-9_]{3,64})$")
+
+
+def _extract_username_candidate(value: str) -> Optional[str]:
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    candidate = candidate.lstrip("@")
+    if not candidate:
+        return None
+    if _USERNAME_TOKEN.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def _normalize_link_value(value: str) -> Optional[str]:
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    identifier = _extract_identifier_from_link(candidate)
+    if not identifier:
+        return None
+    return f"https://t.me/{identifier}"
+
+
+def _prepare_group_fields(name: str, username: str, link: str) -> tuple[str, str, str]:
+    fields = {
+        "name": name.strip(),
+        "username": username.strip(),
+        "link": link.strip(),
+    }
+    for key in ("name", "username", "link"):
+        value = fields.get(key) or ""
+        if not value:
+            continue
+        link_candidate = _normalize_link_value(value)
+        if link_candidate and not fields["link"]:
+            fields["link"] = link_candidate
+            if key != "link":
+                fields[key] = ""
+            continue
+        username_candidate = _extract_username_candidate(value)
+        if username_candidate and not fields["username"]:
+            fields["username"] = username_candidate
+            if key != "username":
+                fields[key] = ""
+    return fields["name"], fields["username"], fields["link"]
+
+
 def _expect_step(context: BotContext, step: GroupUploadStep):
     def predicate(event: NewMessage.Event) -> bool:
         if not event.is_private or getattr(event.message, "out", False):
@@ -163,6 +216,7 @@ def _parse_xlsx(content: bytes) -> List[ParsedGroup]:
         name = _normalize_cell_value(row[0]) if len(row) > 0 else ""
         username = _normalize_cell_value(row[1]) if len(row) > 1 else ""
         link = _normalize_cell_value(row[2]) if len(row) > 2 else ""
+        name, username, link = _prepare_group_fields(name, username, link)
         if idx == 0 and _is_header_row(name, username, link):
             continue
         if not any((name, username, link)):
@@ -180,6 +234,7 @@ def _parse_xls(content: bytes) -> List[ParsedGroup]:
         name = _normalize_cell_value(row[0]) if len(row) > 0 else ""
         username = _normalize_cell_value(row[1]) if len(row) > 1 else ""
         link = _normalize_cell_value(row[2]) if len(row) > 2 else ""
+        name, username, link = _prepare_group_fields(name, username, link)
         if idx == 0 and _is_header_row(name, username, link):
             continue
         if not any((name, username, link)):
@@ -197,20 +252,21 @@ def _is_header_row(name: str, username: str, link: str) -> bool:
     )
 
 
-async def _resolve_chat_id(client, username: Optional[str], link: Optional[str]) -> tuple[Optional[int], bool]:
+
+async def _resolve_chat_id(client, username: Optional[str], link: Optional[str]) -> tuple[Optional[int], Optional[bool]]:
     candidate = _sanitize_username(username) or _extract_identifier_from_link(link)
     if not candidate:
-        return None, False
+        return None, None
 
     try:
         entity = await client.get_input_entity(candidate)
     except Exception:
-        return None, False
+        return None, None
 
     try:
         peer_id = utils.get_peer_id(entity)
     except Exception:
-        return None, False
+        return None, None
 
     return peer_id, True
 
@@ -260,7 +316,7 @@ async def _parse_groups_file(file_bytes: bytes, extension: str) -> List[ParsedGr
     raise ValueError("Unsupported file extension")
 
 
-def _serialize_group(group: ParsedGroup, chat_id: Optional[int], is_member: bool) -> Mapping[str, object]:
+def _serialize_group(group: ParsedGroup, chat_id: Optional[int], is_member: Optional[bool]) -> Mapping[str, object]:
     return {
         "name": group.name,
         "username": group.username,

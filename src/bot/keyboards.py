@@ -10,6 +10,7 @@ ADD_IMAGE_LABEL = "Добавить картинку для рассылки"
 VIEW_BROADCAST_LABEL = "Просмотреть текст и картинку для рассылки"
 UPLOAD_GROUPS_LABEL = "Загрузить группы из файла"
 VIEW_GROUPS_LABEL = "Просмотреть группы для рассылки"
+BROADCAST_LABEL = "Запустить рассылку"
 
 
 def build_main_menu_keyboard() -> list[list[Button]]:
@@ -28,5 +29,6 @@ def build_main_menu_keyboard() -> list[list[Button]]:
         [
             Button.text(UPLOAD_GROUPS_LABEL, resize=True),
             Button.text(VIEW_GROUPS_LABEL, resize=True),
+            Button.text(BROADCAST_LABEL, resize=True),
         ],
     ]

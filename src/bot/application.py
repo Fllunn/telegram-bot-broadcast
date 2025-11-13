@@ -10,7 +10,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.auth_state import AuthStateManager
-from src.services.broadcast_state import BroadcastStateManager
+from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
 
 
@@ -32,6 +32,7 @@ class BotApplication:
         if self._context is None:
             auth_manager = AuthStateManager()
             broadcast_manager = BroadcastStateManager()
+            broadcast_run_manager = BroadcastRunStateManager()
             groups_manager = GroupUploadStateManager()
             group_view_manager = GroupViewStateManager()
 
@@ -41,6 +42,7 @@ class BotApplication:
                 session_manager=session_manager,
                 auth_manager=auth_manager,
                 broadcast_manager=broadcast_manager,
+                broadcast_run_manager=broadcast_run_manager,
                 groups_manager=groups_manager,
                 group_view_manager=group_view_manager,
             )
