@@ -84,3 +84,18 @@ class SessionRepository:
             },
         )
         return result.matched_count or 0
+
+    async def set_broadcast_images(self, session_ids: Sequence[str], file_id: str) -> int:
+        ids = [session_id for session_id in session_ids if session_id]
+        if not ids:
+            return 0
+        result = await self._collection.update_many(
+            {"session_id": {"$in": ids}},
+            {
+                "$set": {
+                    "metadata.broadcast_image_file_id": file_id,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        return result.matched_count or 0

@@ -13,6 +13,14 @@ class BroadcastStep(str, Enum):
     CHOOSING_ACCOUNT = "choosing_account"
     CONFIRMING_REPLACE = "confirming_replace"
     WAITING_TEXT = "waiting_text"
+    WAITING_IMAGE = "waiting_image"
+
+
+class BroadcastFlow(str, Enum):
+    """Indicates which kind of broadcast content is being configured."""
+
+    TEXT = "text"
+    IMAGE = "image"
 
 
 @dataclass(slots=True)
@@ -20,6 +28,7 @@ class BroadcastSession:
     """Stores transient state for managing broadcast text updates."""
 
     step: BroadcastStep = BroadcastStep.IDLE
+    flow: BroadcastFlow = BroadcastFlow.TEXT
     apply_to_all: bool = False
     target_session_ids: List[str] = field(default_factory=list)
     last_message_id: Optional[int] = None
@@ -39,12 +48,14 @@ class BroadcastStateManager:
         user_id: int,
         *,
         step: BroadcastStep,
+        flow: BroadcastFlow,
         apply_to_all: bool = False,
         session_ids: Optional[List[str]] = None,
         last_message_id: Optional[int] = None,
     ) -> BroadcastSession:
         state = BroadcastSession(
             step=step,
+            flow=flow,
             apply_to_all=apply_to_all,
             target_session_ids=list(session_ids or []),
             last_message_id=last_message_id,
