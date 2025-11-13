@@ -18,6 +18,7 @@ from src.bot.commands.account import setup_account_commands  # noqa: E402
 from src.bot.commands.help import setup_help_command  # noqa: E402
 from src.bot.commands.start import setup_start_command  # noqa: E402
 from src.bot.commands.broadcast import setup_broadcast_commands  # noqa: E402
+from src.bot.commands.groups import setup_group_commands  # noqa: E402
 
 
 COMMAND_REGISTRY: tuple[CommandSetup, ...] = (
@@ -25,4 +26,5 @@ COMMAND_REGISTRY: tuple[CommandSetup, ...] = (
     setup_help_command,
     setup_account_commands,
     setup_broadcast_commands,
+    setup_group_commands,
 )

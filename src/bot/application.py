@@ -11,6 +11,7 @@ from src.db.repositories.user_repository import UserRepository
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.auth_state import AuthStateManager
 from src.services.broadcast_state import BroadcastStateManager
+from src.services.groups_state import GroupUploadStateManager
 
 
 class BotApplication:
@@ -31,6 +32,7 @@ class BotApplication:
         if self._context is None:
             auth_manager = AuthStateManager()
             broadcast_manager = BroadcastStateManager()
+            groups_manager = GroupUploadStateManager()
 
             self._context = BotContext(
                 user_repository=user_repository,
@@ -38,6 +40,7 @@ class BotApplication:
                 session_manager=session_manager,
                 auth_manager=auth_manager,
                 broadcast_manager=broadcast_manager,
+                groups_manager=groups_manager,
             )
 
         await self._client.start(bot_token=self._bot_token)

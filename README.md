@@ -12,6 +12,7 @@ Boilerplate for a production-ready Telegram bot that manages multiple user accou
 - Multi-account onboarding via phone number and QR code (with 2FA support)
 - Broadcast workflow with per-account text and image storage plus confirmation prompts
 - In-bot preview of saved broadcast materials (text and images)
+- Excel-based group list uploads per account with validation and storage
 
 ## Getting Started
 

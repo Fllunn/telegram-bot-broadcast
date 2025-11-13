@@ -100,3 +100,17 @@ class SessionRepository:
             },
         )
         return result.matched_count or 0
+
+    async def set_broadcast_groups(self, session_id: str, groups: Sequence[dict[str, Any]]) -> bool:
+        if not session_id:
+            return False
+        update = await self._collection.update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "metadata.broadcast_groups": list(groups),
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        return update.matched_count > 0

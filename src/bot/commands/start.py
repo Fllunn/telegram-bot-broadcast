@@ -27,7 +27,7 @@ def setup_start_command(client, context: BotContext) -> None:
         await event.respond(
             (
                 "Привет! Я помогу подключить и управлять несколькими аккаунтами."
-                "\nИспользуйте кнопки ниже или команды /help, /login_phone, /login_qr, /accounts, /add_text, /add_image, /view_broadcast."
+                "\nИспользуйте кнопки ниже или команды /help, /login_phone, /login_qr, /accounts, /add_text, /add_image, /view_broadcast, /upload_groups."
             ),
             buttons=build_main_menu_keyboard(),
         )
