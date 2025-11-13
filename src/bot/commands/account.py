@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import io
 import logging
+import re
 from typing import Any, Awaitable, Callable
 
 import qrcode
 from telethon import Button, TelegramClient, events
+from telethon.tl.custom.message import Message
 from telethon.events import NewMessage
 from telethon.errors import (
     PasswordHashInvalidError,
@@ -19,6 +21,7 @@ from telethon.errors import (
 )
 
 from src.bot.context import BotContext
+from src.bot.keyboards import ACCOUNTS_LABEL, LOGIN_PHONE_LABEL, LOGIN_QR_LABEL, build_main_menu_keyboard
 from src.models.session import SessionOwnerType, TelethonSession
 from src.services.auth_state import AuthSession, AuthStep
 
@@ -26,7 +29,6 @@ from src.services.auth_state import AuthSession, AuthStep
 logger = logging.getLogger(__name__)
 
 CANCEL_LABEL = "Отмена"
-LOGIN_PHONE_LABEL = "Подключить аккаунт 📱"
 LOGOUT_LABEL = "Выйти из аккаунта"
 QR_REFRESH_LABEL = "Обновить QR"
 QR_IMAGE_NAME = "telegram_login_qr.png"
@@ -34,6 +36,10 @@ QR_REFRESH_PREFIX = "qr_refresh"
 QR_CANCEL_PREFIX = "qr_cancel"
 QR_REFRESH_PATTERN = rf"^{QR_REFRESH_PREFIX}:".encode("utf-8")
 QR_CANCEL_PATTERN = rf"^{QR_CANCEL_PREFIX}:".encode("utf-8")
+LOGIN_PHONE_PATTERN = rf"^(?:/login_phone(?:@\w+)?|{re.escape(LOGIN_PHONE_LABEL)})$"
+LOGIN_QR_PATTERN = rf"^(?:/login_qr(?:@\w+)?|{re.escape(LOGIN_QR_LABEL)})$"
+ACCOUNTS_PATTERN = rf"^(?:/accounts(?:@\w+)?|{re.escape(ACCOUNTS_LABEL)})$"
+LOGOUT_PATTERN = rf"^(?:/logout(?:@\w+)?|{re.escape(LOGOUT_LABEL)})$"
 
 SendMessageFn = Callable[[str, Any], Awaitable[object]]
 
@@ -184,7 +190,7 @@ async def _wait_for_qr_authorization(
             await bot_client.send_message(
                 user_id,
                 "Попробуйте начать авторизацию заново командой /login_qr.",
-                buttons=_build_single_button(LOGIN_PHONE_LABEL),
+                buttons=build_main_menu_keyboard(),
             )
             return
 
@@ -220,7 +226,7 @@ async def _wait_for_qr_authorization(
             await bot_client.send_message(
                 user_id,
                 "Не удалось завершить авторизацию по QR. Попробуйте заново или используйте вход по номеру телефона.",
-                buttons=_build_single_button(LOGIN_PHONE_LABEL),
+                buttons=build_main_menu_keyboard(),
             )
             return
 
@@ -253,7 +259,7 @@ def _expect_step(context: BotContext, step: AuthStep):
 async def _cancel_flow(event: NewMessage.Event, context: BotContext) -> None:
     user_id = event.sender_id
     await _cleanup_session(context, user_id)
-    await event.respond("Авторизация отменена.", buttons=Button.clear())
+    await event.respond("Авторизация отменена.", buttons=build_main_menu_keyboard())
 
 
 async def _finalize_login(
@@ -270,7 +276,7 @@ async def _finalize_login(
         logger.exception("Не удалось получить информацию о профиле после авторизации", extra={"user_id": user_id})
         await send_message(
             "Не удалось завершить авторизацию. Попробуйте снова или войдите через номер телефона.",
-            Button.clear(),
+            build_main_menu_keyboard(),
         )
         await _cleanup_session(context, user_id, session_client=session_client)
         return
@@ -280,7 +286,7 @@ async def _finalize_login(
         logger.error("Не удалось получить номер телефона авторизованного аккаунта", extra={"user_id": user_id})
         await send_message(
             "Telegram не вернул номер телефона аккаунта. Попробуйте войти через номер телефона.",
-            Button.clear(),
+            build_main_menu_keyboard(),
         )
         await _cleanup_session(context, user_id, session_client=session_client)
         return
@@ -313,7 +319,7 @@ async def _finalize_login(
         logger.exception("Не удалось сохранить Telethon-сессию", extra={"user_id": user_id})
         await send_message(
             "Не удалось сохранить сессию. Попробуйте позже или повторите вход.",
-            Button.clear(),
+            build_main_menu_keyboard(),
         )
         await _cleanup_session(context, user_id, session_client=session_client)
         return
@@ -335,7 +341,7 @@ async def _finalize_login(
             "Пользователь %s повторно авторизовал аккаунт", user_id, extra={"owner_id": user_id, "account_id": me.id}
         )
 
-    await send_message(message, Button.clear())
+    await send_message(message, build_main_menu_keyboard())
 
 
 async def _prompt_logout_selection(event: NewMessage.Event, context: BotContext) -> None:
@@ -343,7 +349,7 @@ async def _prompt_logout_selection(event: NewMessage.Event, context: BotContext)
     if not sessions:
         await event.respond(
             "У вас нет активных аккаунтов. Подключите новый через /login_phone.",
-            buttons=_build_single_button(LOGIN_PHONE_LABEL),
+            buttons=build_main_menu_keyboard(),
         )
         return
 
@@ -357,7 +363,7 @@ async def _prompt_logout_selection(event: NewMessage.Event, context: BotContext)
 def setup_account_commands(client, context: BotContext) -> None:
     """Register account management commands."""
 
-    @client.on(events.NewMessage(pattern=r"^/accounts(?:@\w+)?$"))
+    @client.on(events.NewMessage(pattern=ACCOUNTS_PATTERN))
     async def handle_accounts(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
@@ -366,6 +372,7 @@ def setup_account_commands(client, context: BotContext) -> None:
         if not sessions:
             await event.respond(
                 "У вас пока нет подключённых аккаунтов. Используйте /login_phone, чтобы подключить первый аккаунт.",
+                buttons=build_main_menu_keyboard(),
             )
             return
 
@@ -375,7 +382,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             buttons=_build_logout_buttons(sessions),
         )
 
-    @client.on(events.NewMessage(pattern=rf"^(?:/logout(?:@\w+)?|{LOGOUT_LABEL})$"))
+    @client.on(events.NewMessage(pattern=LOGOUT_PATTERN))
     async def handle_logout_command(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
@@ -389,7 +396,7 @@ def setup_account_commands(client, context: BotContext) -> None:
 
         await _prompt_logout_selection(event, context)
 
-    @client.on(events.NewMessage(pattern=rf"^(?:/login_phone(?:@\w+)?|{LOGIN_PHONE_LABEL})$"))
+    @client.on(events.NewMessage(pattern=LOGIN_PHONE_PATTERN))
     async def handle_login_phone(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
@@ -416,7 +423,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             buttons=_build_single_button(CANCEL_LABEL),
         )
 
-    @client.on(events.NewMessage(pattern=r"^/login_qr(?:@\w+)?$"))
+    @client.on(events.NewMessage(pattern=LOGIN_QR_PATTERN))
     async def handle_login_qr(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
@@ -449,7 +456,7 @@ def setup_account_commands(client, context: BotContext) -> None:
                     await context.session_manager.close_client(temp_client)
             await event.respond(
                 "Не удалось создать QR-код. Попробуйте позже или используйте вход по номеру телефона.",
-                buttons=_build_single_button(LOGIN_PHONE_LABEL),
+                buttons=build_main_menu_keyboard(),
             )
             return
 
@@ -464,7 +471,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             await _cleanup_session(context, user_id, session_client=temp_client)
             await event.respond(
                 "Не удалось отправить QR-код. Попробуйте снова или используйте вход по номеру телефона.",
-                buttons=_build_single_button(LOGIN_PHONE_LABEL),
+                buttons=build_main_menu_keyboard(),
             )
             return
 
@@ -510,7 +517,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             context.auth_manager.clear(event.sender_id)
             await event.respond(
                 "Этот номер заблокирован Telegram. Попробуйте другой номер или обратитесь в поддержку Telegram.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             return
         except Exception:
@@ -553,7 +560,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.error("Состояние авторизации повреждено", extra={"user_id": event.sender_id})
             await event.respond(
                 "Текущая попытка авторизации недоступна. Попробуйте начать заново командой /login_phone.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             context.auth_manager.clear(event.sender_id)
             return
@@ -578,7 +585,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.warning("Код авторизации истёк", extra={"user_id": event.sender_id})
             await event.respond(
                 "Срок действия кода истёк. Отправьте /login_phone, чтобы получить новый код.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             await context.session_manager.close_client(state.client)
             context.auth_manager.clear(event.sender_id)
@@ -594,7 +601,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.error("Номер заблокирован при подтверждении кода", extra={"user_id": event.sender_id})
             await event.respond(
                 "Этот номер заблокирован Telegram. Попробуйте другой номер.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             await context.session_manager.close_client(state.client)
             context.auth_manager.clear(event.sender_id)
@@ -603,7 +610,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.exception("Ошибка при подтверждении кода", extra={"user_id": event.sender_id})
             await event.respond(
                 "Не удалось подтвердить код. Попробуйте снова начать авторизацию командой /login_phone.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             await context.session_manager.close_client(state.client)
             context.auth_manager.clear(event.sender_id)
@@ -645,7 +652,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.error("Состояние авторизации повреждено (пароль)", extra={"user_id": event.sender_id})
             await event.respond(
                 "Не удалось продолжить авторизацию. Начните заново командой /login_phone.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             context.auth_manager.clear(event.sender_id)
             return
@@ -665,7 +672,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             logger.exception("Ошибка при вводе 2FA пароля", extra={"user_id": event.sender_id})
             await event.respond(
                 "Не удалось подтвердить пароль. Начните вход заново командой /login_phone.",
-                buttons=Button.clear(),
+                buttons=build_main_menu_keyboard(),
             )
             await context.session_manager.close_client(state.client)
             context.auth_manager.clear(event.sender_id)
@@ -738,7 +745,7 @@ def setup_account_commands(client, context: BotContext) -> None:
 
         await _cleanup_session(context, user_id)
         await event.answer("Авторизация отменена.")
-        await client.send_message(user_id, "Авторизация отменена.", buttons=Button.clear())
+        await client.send_message(user_id, "Авторизация отменена.", buttons=build_main_menu_keyboard())
         with contextlib.suppress(Exception):
             await event.message.delete()
 

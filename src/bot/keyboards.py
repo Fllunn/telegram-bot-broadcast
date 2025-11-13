@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from telethon import Button
+
+LOGIN_PHONE_LABEL = "Подключить аккаунт через номер"
+LOGIN_QR_LABEL = "Подключить аккаунт через QR-код"
+ACCOUNTS_LABEL = "Посмотреть все аккаунты"
+
+
+def build_main_menu_keyboard() -> list[list[Button]]:
+    """Reply keyboard with primary account management actions."""
+    return [
+        [Button.text(LOGIN_PHONE_LABEL, resize=True)],
+        [Button.text(LOGIN_QR_LABEL, resize=True)],
+        [Button.text(ACCOUNTS_LABEL, resize=True)],
+    ]

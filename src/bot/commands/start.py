@@ -5,6 +5,7 @@ from telethon.events import NewMessage
 
 from src.bot.context import BotContext
 from src.models.user import User
+from src.bot.keyboards import build_main_menu_keyboard
 
 
 def setup_start_command(client, context: BotContext) -> None:
@@ -24,5 +25,9 @@ def setup_start_command(client, context: BotContext) -> None:
             await context.user_repository.upsert_user(user)
 
         await event.respond(
-            "Привет! Я помогу подключить и управлять несколькими аккаунтами. Используй /help, чтобы узнать команды."
+            (
+                "Привет! Я помогу подключить и управлять несколькими аккаунтами."
+                "\nИспользуйте кнопки ниже или команды /help, /login_phone, /login_qr, /accounts."
+            ),
+            buttons=build_main_menu_keyboard(),
         )
