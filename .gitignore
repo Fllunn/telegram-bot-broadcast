@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+ruff_cache/
+.pyre/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs
+logs/
+*.log
+
+# Tooling
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Telethon sessions & temporary data
+*.session
+*.session-journal
+
+# OS files
+.DS_Store
+Thumbs.db
