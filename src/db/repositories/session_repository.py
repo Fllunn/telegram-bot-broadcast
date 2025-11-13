@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo import ReturnDocument
@@ -69,3 +69,18 @@ class SessionRepository:
     async def delete_session(self, session_id: str) -> bool:
         result = await self._collection.delete_one({"session_id": session_id})
         return result.deleted_count > 0
+
+    async def set_broadcast_texts(self, session_ids: Sequence[str], text: str) -> int:
+        ids = [session_id for session_id in session_ids if session_id]
+        if not ids:
+            return 0
+        result = await self._collection.update_many(
+            {"session_id": {"$in": ids}},
+            {
+                "$set": {
+                    "metadata.broadcast_text": text,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        return result.matched_count or 0

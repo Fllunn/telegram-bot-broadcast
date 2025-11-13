@@ -17,10 +17,12 @@ class CommandSetup(Protocol):
 from src.bot.commands.account import setup_account_commands  # noqa: E402
 from src.bot.commands.help import setup_help_command  # noqa: E402
 from src.bot.commands.start import setup_start_command  # noqa: E402
+from src.bot.commands.broadcast import setup_broadcast_commands  # noqa: E402
 
 
 COMMAND_REGISTRY: tuple[CommandSetup, ...] = (
     setup_start_command,
     setup_help_command,
     setup_account_commands,
+    setup_broadcast_commands,
 )
