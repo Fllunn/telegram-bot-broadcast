@@ -9,6 +9,7 @@ Boilerplate for a production-ready Telegram bot that manages multiple user accou
 - Centralized settings management powered by `.env`
 - Modular design (`bot/`, `db/`, `services/`, `models/`, `utils/`)
 - Structured logging configuration
+- Multi-account onboarding via phone number and QR code (with 2FA support)
 
 ## Getting Started
 
@@ -73,8 +74,8 @@ src/
 
 ## Next Steps
 
-- Implement the phone/QR login flows for Telethon user sessions
-- Persist session strings in Mongo via the provided repositories
-- Extend bot command handlers with actual business logic
+- Extend command handlers with broadcast-specific business logic
+- Wire the project into your deployment and observability stack
+- Add automated tests covering onboarding and broadcast scenarios
 
 Refer to inline comments for guidance on where to plug in your implementation.

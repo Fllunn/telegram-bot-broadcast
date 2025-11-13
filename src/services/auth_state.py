@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+from asyncio import Task
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 
 from telethon import TelegramClient
 
+if TYPE_CHECKING:
+    from telethon.tl.custom.qrlogin import QRLogin
+
 
 class AuthStep(str, Enum):
-    """Represents the current step in the phone login flow."""
+    """Represents the current step in the interactive authorization flow."""
 
     IDLE = "idle"
     WAITING_PHONE = "waiting_phone"
     WAITING_CODE = "waiting_code"
     WAITING_PASSWORD = "waiting_password"
+    WAITING_QR = "waiting_qr"
 
 
 @dataclass(slots=True)
@@ -25,6 +30,8 @@ class AuthSession:
     phone_code_hash: Optional[str] = None
     client: Optional[TelegramClient] = None
     last_message_id: Optional[int] = None
+    qr_login: Optional["QRLogin"] = None
+    qr_task: Optional[Task] = None
 
 
 class AuthStateManager:
