@@ -7,6 +7,7 @@ LOGIN_QR_LABEL = "Подключить аккаунт через QR-код"
 ACCOUNTS_LABEL = "Посмотреть все аккаунты"
 ADD_TEXT_LABEL = "Добавить текст для рассылки"
 ADD_IMAGE_LABEL = "Добавить картинку для рассылки"
+VIEW_BROADCAST_LABEL = "Просмотреть текст и картинку для рассылки"
 
 
 def build_main_menu_keyboard() -> list[list[Button]]:
@@ -17,4 +18,5 @@ def build_main_menu_keyboard() -> list[list[Button]]:
         [Button.text(ACCOUNTS_LABEL, resize=True)],
         [Button.text(ADD_TEXT_LABEL, resize=True)],
         [Button.text(ADD_IMAGE_LABEL, resize=True)],
+        [Button.text(VIEW_BROADCAST_LABEL, resize=True)],
     ]
