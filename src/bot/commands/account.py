@@ -29,7 +29,6 @@ from src.services.auth_state import AuthSession, AuthStep
 logger = logging.getLogger(__name__)
 
 CANCEL_LABEL = "Отмена"
-LOGOUT_LABEL = "Выйти из аккаунта"
 QR_REFRESH_LABEL = "Обновить QR"
 QR_IMAGE_NAME = "telegram_login_qr.png"
 QR_REFRESH_PREFIX = "qr_refresh"
@@ -39,7 +38,6 @@ QR_CANCEL_PATTERN = rf"^{QR_CANCEL_PREFIX}:".encode("utf-8")
 LOGIN_PHONE_PATTERN = rf"^(?:/login_phone(?:@\w+)?|{re.escape(LOGIN_PHONE_LABEL)})$"
 LOGIN_QR_PATTERN = rf"^(?:/login_qr(?:@\w+)?|{re.escape(LOGIN_QR_LABEL)})$"
 ACCOUNTS_PATTERN = rf"^(?:/accounts(?:@\w+)?|{re.escape(ACCOUNTS_LABEL)})$"
-LOGOUT_PATTERN = rf"^(?:/logout(?:@\w+)?|{re.escape(LOGOUT_LABEL)})$"
 
 SendMessageFn = Callable[[str, Any], Awaitable[object]]
 
@@ -344,22 +342,6 @@ async def _finalize_login(
     await send_message(message, build_main_menu_keyboard())
 
 
-async def _prompt_logout_selection(event: NewMessage.Event, context: BotContext) -> None:
-    sessions = list(await context.session_manager.get_active_sessions(event.sender_id))
-    if not sessions:
-        await event.respond(
-            "У вас нет активных аккаунтов. Подключите новый через /login_phone.",
-            buttons=build_main_menu_keyboard(),
-        )
-        return
-
-    body = "\n".join(_format_session(session) for session in sessions)
-    await event.respond(
-        f"Выберите аккаунт, из которого нужно выйти:\n{body}\n\nНажмите кнопку напротив нужного аккаунта.",
-        buttons=_build_logout_buttons(sessions),
-    )
-
-
 def setup_account_commands(client, context: BotContext) -> None:
     """Register account management commands."""
 
@@ -381,20 +363,6 @@ def setup_account_commands(client, context: BotContext) -> None:
             f"Подключённые аккаунты:\n{body}\n\nНажмите кнопку, чтобы отключить аккаунт.",
             buttons=_build_logout_buttons(sessions),
         )
-
-    @client.on(events.NewMessage(pattern=LOGOUT_PATTERN))
-    async def handle_logout_command(event: NewMessage.Event) -> None:
-        if not event.is_private:
-            return
-
-        if context.auth_manager.has_active_flow(event.sender_id):
-            await event.respond(
-                "Сначала завершите текущую авторизацию или нажмите «Отмена».",
-                buttons=_build_single_button(CANCEL_LABEL),
-            )
-            return
-
-        await _prompt_logout_selection(event, context)
 
     @client.on(events.NewMessage(pattern=LOGIN_PHONE_PATTERN))
     async def handle_login_phone(event: NewMessage.Event) -> None:
@@ -788,25 +756,44 @@ def setup_account_commands(client, context: BotContext) -> None:
             await event.answer("Сессия не найдена.", alert=True)
             return
 
-        removed = await context.session_manager.remove_session(session_id)
-        if not removed:
-            await event.answer("Не удалось отключить аккаунт.", alert=True)
+        try:
+            removed = await context.session_manager.remove_session(session)
+        except Exception:
+            logger.exception(
+                "Ошибка при удалении пользовательской сессии",
+                extra={"user_id": user_id, "session_id": session.session_id},
+            )
+            await event.answer("Не удалось отключить аккаунт. Попробуйте позже.", alert=True)
             return
+
+        if not removed:
+            await event.answer("Аккаунт уже был отключён.", alert=True)
+            # Continue to refresh the list for пользовательского удобства.
 
         target = _render_account_target(session)
 
         remaining = list(await context.session_manager.get_active_sessions(user_id))
-        await event.answer("Аккаунт отключён.")
+        if removed:
+            await event.answer("Аккаунт отключён.")
+
+        status_header = (
+            f"✅ Аккаунт {target} отключён."
+            if removed
+            else f"Аккаунт {target} уже был отключён ранее."
+        )
 
         if remaining:
             body = "\n".join(_format_session(item) for item in remaining)
             await event.edit(
-                f"✅ Аккаунт {target} отключён.\n\nПодключённые аккаунты:\n{body}\n\nЧтобы отключить другой аккаунт, выберите его ниже.",
+                (
+                    f"{status_header}\n\nПодключённые аккаунты:\n{body}\n\n"
+                    "Чтобы отключить другой аккаунт, выберите его ниже."
+                ),
                 buttons=_build_logout_buttons(remaining),
             )
         else:
             await event.edit(
-                f"✅ Аккаунт {target} отключён.\n\nПодключите новый аккаунт через /login_phone.",
+                f"{status_header}\n\nПодключите новый аккаунт через /login_phone.",
             )
 
     @client.on(events.CallbackQuery(pattern=b"^logout_cancel:"))
