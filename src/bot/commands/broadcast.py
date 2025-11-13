@@ -376,12 +376,12 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 		user_id = event.sender_id
 		config = _flow_config(flow)
 
-		if context.broadcast_manager.has_active_flow(user_id):
-			await event.respond(
-				"Вы уже настраиваете параметры рассылки. Завершите текущий процесс или отправьте «Отмена».",
-				buttons=[[Button.text(CANCEL_LABEL, resize=True)]],
+		previous_state = context.broadcast_manager.clear(user_id)
+		if previous_state and previous_state.step != BroadcastStep.IDLE:
+			logger.info(
+				"Прерван незавершённый поток настройки рассылки",
+				extra={"user_id": user_id, "flow": previous_state.flow.value, "step": previous_state.step.value},
 			)
-			return
 
 		sessions = list(await context.session_manager.get_active_sessions(user_id))
 		if not sessions:
@@ -416,13 +416,12 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			return
 
 		user_id = event.sender_id
-
-		if context.broadcast_manager.has_active_flow(user_id):
-			await event.respond(
-				"Сначала завершите текущую настройку рассылки или отправьте «Отмена».",
-				buttons=[[Button.text(CANCEL_LABEL, resize=True)]],
+		previous_state = context.broadcast_manager.clear(user_id)
+		if previous_state and previous_state.step != BroadcastStep.IDLE:
+			logger.info(
+				"Пользователь переключился на просмотр материалов во время настройки",
+				extra={"user_id": user_id, "flow": previous_state.flow.value, "step": previous_state.step.value},
 			)
-			return
 
 		try:
 			sessions = list(await context.session_manager.get_active_sessions(user_id))

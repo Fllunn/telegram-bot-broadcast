@@ -418,6 +418,13 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
 
         user_id = event.sender_id
+        existing_upload = upload_manager.get(user_id)
+        if existing_upload and existing_upload.step != GroupUploadStep.IDLE:
+            logger.info(
+                "Сбрасываем незавершённую загрузку групп",
+                extra={"user_id": user_id, "step": existing_upload.step.value},
+            )
+            upload_manager.clear(user_id)
         if upload_manager.has_active_flow(user_id):
             await event.respond(
                 "Вы уже загружаете список групп. Завершите текущий процесс или отправьте «Отмена».",
@@ -709,6 +716,13 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
 
         user_id = event.sender_id
+        existing_view = view_manager.get(user_id)
+        if existing_view and existing_view.step != GroupViewStep.IDLE:
+            logger.info(
+                "Сбрасываем незавершённый просмотр групп",
+                extra={"user_id": user_id, "step": existing_view.step.value},
+            )
+            view_manager.clear(user_id)
         if view_manager.has_active_flow(user_id):
             await event.respond(
                 "Вы уже просматриваете списки групп. Завершите текущий просмотр или используйте кнопку «❌ Закончить просмотр».",

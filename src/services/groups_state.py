@@ -148,10 +148,15 @@ class GroupViewStateManager:
             self._states[user_id] = session
         for key, value in kwargs.items():
             setattr(session, key, value)
+        if "step" in kwargs and kwargs["step"] != GroupViewStep.VIEWING:
+            session.pagination_tokens.clear()
         return session
 
     def clear(self, user_id: int) -> Optional[GroupViewSession]:
-        return self._states.pop(user_id, None)
+        session = self._states.pop(user_id, None)
+        if session is not None:
+            session.pagination_tokens.clear()
+        return session
 
     def has_active_flow(self, user_id: int) -> bool:
         session = self._states.get(user_id)
