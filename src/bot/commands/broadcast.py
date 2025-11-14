@@ -1711,9 +1711,11 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 				sessions=[],
 				materials_available=False,
 			)
+			run_manager.clear(user_id)
 			await event.respond(
-				"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста/картинки.\n\nУ вас нет подключённых аккаунтов. Подключите аккаунт командой /login_phone или /login_qr.",
-				buttons=_build_connect_account_keyboard(),
+				"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста или картинки.\n\n"
+				"Подключите аккаунт командой /login_phone или /login_qr, затем вернитесь в главное меню и повторите запуск.",
+				buttons=build_main_menu_keyboard(),
 			)
 			return
 
@@ -1730,9 +1732,11 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 				current_state=state_snapshot,
 				sessions=snapshot,
 			)
+			run_manager.clear(user_id)
 			await event.respond(
-				"Текст или картинка для рассылки не найдены. Используйте /add_text или /add_image.",
-				buttons=_build_missing_content_keyboard(),
+				"Нельзя запустить рассылку: нет сохранённого текста или картинки."
+				"\nДобавьте материалы через /add_text или /add_image и запустите рассылку снова.",
+				buttons=build_main_menu_keyboard(),
 			)
 			return
 
@@ -2016,9 +2020,11 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 					sessions=[],
 					materials_available=False,
 				)
+				run_manager.clear(user_id)
 				await event.respond(
-					"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста/картинки.\n\nУ вас нет подключённых аккаунтов. Подключите аккаунт командой /login_phone или /login_qr.",
-					buttons=_build_connect_account_keyboard(),
+					"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста или картинки.\n\n"
+					"Подключите аккаунт командой /login_phone или /login_qr, затем вернитесь в главное меню и повторите запуск.",
+					buttons=build_main_menu_keyboard(),
 				)
 				return
 
@@ -2035,9 +2041,11 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 					current_state=state_snapshot,
 					sessions=snapshot,
 				)
+				run_manager.clear(user_id)
 				await event.respond(
-					"Текст или картинка для рассылки не найдены. Используйте /add_text или /add_image.",
-					buttons=_build_missing_content_keyboard(),
+					"Нельзя запустить рассылку: нет сохранённого текста или картинки."
+					"\nДобавьте материалы через /add_text или /add_image и запустите рассылку снова.",
+					buttons=build_main_menu_keyboard(),
 				)
 				return
 
