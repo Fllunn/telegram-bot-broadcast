@@ -27,11 +27,13 @@ from telethon.errors.rpcerrorlist import MediaEmptyError
 
 from src.bot.context import BotContext
 from src.bot.keyboards import (
-    ADD_IMAGE_LABEL,
-    ADD_TEXT_LABEL,
-    BROADCAST_LABEL,
-    VIEW_BROADCAST_LABEL,
-    build_main_menu_keyboard,
+	ADD_IMAGE_LABEL,
+	ADD_TEXT_LABEL,
+	BROADCAST_LABEL,
+	LOGIN_PHONE_LABEL,
+	LOGIN_QR_LABEL,
+	VIEW_BROADCAST_LABEL,
+	build_main_menu_keyboard,
 )
 
 from src.models.session import TelethonSession
@@ -360,10 +362,62 @@ def _build_broadcast_confirmation_buttons() -> list[list[Button]]:
 	]
 
 
+def _build_missing_content_keyboard() -> list[list[Button]]:
+	return [
+		[Button.text(ADD_TEXT_LABEL, resize=True)],
+		[Button.text(ADD_IMAGE_LABEL, resize=True)],
+		[Button.text(CANCEL_LABEL, resize=True)],
+	]
+
+
+def _build_connect_account_keyboard() -> list[list[Button]]:
+	return [
+		[Button.text(LOGIN_PHONE_LABEL, resize=True)],
+		[Button.text(LOGIN_QR_LABEL, resize=True)],
+		[Button.text(CANCEL_LABEL, resize=True)],
+	]
+
+
 def _build_progress_buttons(cancel_requested: bool) -> list[list[Button]] | None:
 	if cancel_requested:
 		return None
 	return [[Button.inline("❌ Отмена рассылки", f"{RUN_STOP_PREFIX}:now".encode("utf-8"))]]
+
+
+def _collect_session_materials_snapshot(sessions: Iterable[TelethonSession]) -> list[dict[str, object]]:
+	snapshot: list[dict[str, object]] = []
+	for session in sessions:
+		metadata = session.metadata or {}
+		raw_text = metadata.get("broadcast_text")
+		text_value = str(raw_text).strip() if isinstance(raw_text, str) else None
+		has_text = bool(text_value)
+		image_meta = _extract_image_metadata(metadata)
+		has_image = bool(image_meta and not image_meta.get("legacy_file_id"))
+		snapshot.append(
+			{
+				"session_id": session.session_id,
+				"label": _render_session_label(session),
+				"has_text": has_text,
+				"has_image": has_image,
+			}
+		)
+	return snapshot
+
+
+def _describe_broadcast_flow_state(state) -> dict[str, object]:
+	if state is None:
+		return {
+			"flow": None,
+			"step": BroadcastStep.IDLE.value,
+			"apply_to_all": False,
+			"targets": [],
+		}
+	return {
+		"flow": state.flow.value,
+		"step": state.step.value,
+		"apply_to_all": state.apply_to_all,
+		"targets": list(state.target_session_ids or []),
+	}
 
 
 def _extract_broadcast_groups(metadata: Optional[Mapping[str, object]]) -> list[Mapping[str, object]]:
@@ -1591,6 +1645,311 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 		message = await event.respond(config.start_prompt, buttons=_build_scope_buttons())
 		context.broadcast_manager.update(user_id, last_message_id=message.id)
 
+	@client.on(events.NewMessage(pattern=BROADCAST_PATTERN))
+	async def handle_broadcast_run_command(event: NewMessage.Event) -> None:
+		if not event.is_private:
+			return
+
+		user_id = event.sender_id
+		previous_setup = context.broadcast_manager.get(user_id)
+		state_snapshot = _describe_broadcast_flow_state(previous_setup)
+		if previous_setup and previous_setup.step != BroadcastStep.IDLE:
+			_log_broadcast(
+				logging.INFO,
+				"Запуск рассылки заблокирован активным сценарием настройки материалов",
+				user_id=user_id,
+				current_state=state_snapshot,
+			)
+			await event.respond(
+				"Вы сейчас настраиваете материалы для рассылки. Завершите текущее действие или нажмите «Отмена», чтобы его прервать.",
+				buttons=[[Button.text(CANCEL_LABEL, resize=True)]],
+			)
+			return
+
+		run_state = run_manager.get(user_id)
+		if run_state:
+			if run_state.task and not run_state.task.done():
+				_log_broadcast(
+					logging.INFO,
+					"Запрос запуска отклонён: рассылка уже выполняется",
+					user_id=user_id,
+					run_state_step=run_state.step.value,
+					cancel_requested=run_state.cancel_requested,
+				)
+				await event.respond(
+					"Рассылка уже выполняется. Используйте кнопку «Отмена рассылки» в сообщении прогресса.",
+					buttons=build_main_menu_keyboard(),
+				)
+				return
+			if run_state.last_trigger_message_id == event.id:
+				_log_broadcast(
+					logging.DEBUG,
+					"Повторный запуск рассылки проигнорирован",
+					user_id=user_id,
+					message_id=event.id,
+				)
+				return
+			run_manager.clear(user_id)
+
+		try:
+			sessions_iter = await context.session_manager.get_active_sessions(user_id)
+		except Exception:
+			logger.exception("Не удалось получить список аккаунтов для рассылки", extra={"user_id": user_id})
+			await event.respond(
+				"Не удалось получить список аккаунтов. Попробуйте позже.",
+				buttons=build_main_menu_keyboard(),
+			)
+			return
+
+		sessions = list(sessions_iter)
+		if not sessions:
+			_log_broadcast(
+				logging.INFO,
+				"Запуск рассылки отклонён: нет подключённых аккаунтов",
+				user_id=user_id,
+				current_state=state_snapshot,
+				sessions=[],
+				materials_available=False,
+			)
+			await event.respond(
+				"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста/картинки.\n\nУ вас нет подключённых аккаунтов. Подключите аккаунт командой /login_phone или /login_qr.",
+				buttons=_build_connect_account_keyboard(),
+			)
+			return
+
+		snapshot = _collect_session_materials_snapshot(sessions)
+		has_text = any(entry["has_text"] for entry in snapshot)
+		has_image = any(entry["has_image"] for entry in snapshot)
+		has_materials = any(entry["has_text"] or entry["has_image"] for entry in snapshot)
+
+		if not has_materials:
+			_log_broadcast(
+				logging.INFO,
+				"Запуск рассылки отклонён: нет материалов",
+				user_id=user_id,
+				current_state=state_snapshot,
+				sessions=snapshot,
+			)
+			await event.respond(
+				"Текст или картинка для рассылки не найдены. Используйте /add_text или /add_image.",
+				buttons=_build_missing_content_keyboard(),
+			)
+			return
+
+		_log_broadcast(
+			logging.INFO,
+			"Запуск рассылки: предварительные проверки пройдены",
+			user_id=user_id,
+			current_state=state_snapshot,
+			sessions=snapshot,
+			has_text=has_text,
+			has_image=has_image,
+		)
+
+		run_manager.begin(
+			user_id,
+			step=BroadcastRunStep.CHOOSING_SCOPE,
+			scope=BroadcastRunScope.SINGLE,
+			sessions={session.session_id: session for session in sessions},
+			last_message_id=event.id,
+			trigger_message_id=event.id,
+		)
+		message = await event.respond(
+			"Выберите, с каких аккаунтов отправлять рассылку.",
+			buttons=_build_broadcast_scope_buttons(),
+		)
+		run_manager.update(user_id, last_message_id=message.id)
+
+	@client.on(events.CallbackQuery(pattern=rf"^{RUN_SCOPE_PREFIX}:".encode("utf-8")))
+	async def handle_broadcast_scope_selection(event: events.CallbackQuery.Event) -> None:
+		user_id = event.sender_id
+		state = run_manager.get(user_id)
+		if state is None or state.step != BroadcastRunStep.CHOOSING_SCOPE:
+			await event.answer("Эта операция больше неактуальна.", alert=True)
+			return
+
+		selection = _extract_payload(event.data, RUN_SCOPE_PREFIX)
+		if selection not in {"single", "all"}:
+			await event.answer("Некорректный выбор.", alert=True)
+			return
+
+		sessions = list(state.sessions.values())
+		if not sessions:
+			run_manager.clear(user_id)
+			await event.edit(
+				"Нет доступных аккаунтов для рассылки.",
+				buttons=build_main_menu_keyboard(),
+			)
+			return
+
+		if selection == "single":
+			run_manager.update(user_id, step=BroadcastRunStep.CHOOSING_ACCOUNT, scope=BroadcastRunScope.SINGLE)
+			edited = await event.edit(
+				"Выберите аккаунт, от имени которого отправлять рассылку.",
+				buttons=_build_broadcast_account_buttons(sessions),
+			)
+			run_manager.update(user_id, last_message_id=edited.id)
+			return
+
+		session_ids = [session.session_id for session in sessions]
+		plan, errors = await _build_broadcast_plan(context, user_id, session_ids, state.sessions)
+		if plan is None or errors:
+			unique_errors = list(dict.fromkeys(errors)) if errors else []
+			error_lines = ["Не удалось подготовить рассылку:"]
+			if unique_errors:
+				error_lines.extend(f"• {message}" for message in unique_errors)
+			else:
+				error_lines.append("• Проверьте настройки материалов и списков групп.")
+			run_manager.clear(user_id)
+			await event.edit("\n".join(error_lines), buttons=build_main_menu_keyboard())
+			return
+
+		run_manager.update(
+			user_id,
+			step=BroadcastRunStep.CONFIRMING,
+			scope=BroadcastRunScope.ALL,
+			target_session_ids=session_ids,
+			plan=plan,
+		)
+		confirmation = _build_confirmation_text(plan)
+		edited = await event.edit(confirmation, buttons=_build_broadcast_confirmation_buttons())
+		run_manager.update(user_id, last_message_id=edited.id)
+
+	@client.on(events.CallbackQuery(pattern=rf"^{RUN_SELECT_PREFIX}:".encode("utf-8")))
+	async def handle_broadcast_account_selection(event: events.CallbackQuery.Event) -> None:
+		user_id = event.sender_id
+		state = run_manager.get(user_id)
+		if state is None or state.step != BroadcastRunStep.CHOOSING_ACCOUNT:
+			await event.answer("Эта операция больше неактуальна.", alert=True)
+			return
+
+		session_id = _extract_payload(event.data, RUN_SELECT_PREFIX)
+		if not session_id:
+			await event.answer("Некорректный выбор.", alert=True)
+			return
+
+		plan, errors = await _build_broadcast_plan(context, user_id, [session_id], state.sessions)
+		if plan is None or errors:
+			unique_errors = list(dict.fromkeys(errors)) if errors else []
+			error_lines = ["Не удалось подготовить рассылку:"]
+			if unique_errors:
+				error_lines.extend(f"• {message}" for message in unique_errors)
+			else:
+				error_lines.append("• Проверьте материалы и список групп выбранного аккаунта.")
+			run_manager.clear(user_id)
+			await event.edit("\n".join(error_lines), buttons=build_main_menu_keyboard())
+			return
+
+		run_manager.update(
+			user_id,
+			step=BroadcastRunStep.CONFIRMING,
+			scope=BroadcastRunScope.SINGLE,
+			target_session_ids=[session_id],
+			plan=plan,
+		)
+		confirmation = _build_confirmation_text(plan)
+		edited = await event.edit(confirmation, buttons=_build_broadcast_confirmation_buttons())
+		run_manager.update(user_id, last_message_id=edited.id)
+
+	@client.on(events.CallbackQuery(pattern=rf"^{RUN_CONFIRM_PREFIX}:".encode("utf-8")))
+	async def handle_broadcast_confirmation(event: events.CallbackQuery.Event) -> None:
+		user_id = event.sender_id
+		state = run_manager.get(user_id)
+		if state is None or state.step != BroadcastRunStep.CONFIRMING:
+			await event.answer("Эта операция больше неактуальна.", alert=True)
+			return
+
+		decision = _extract_payload(event.data, RUN_CONFIRM_PREFIX)
+		if decision == "cancel":
+			run_manager.clear(user_id)
+			await event.edit("Рассылка отменена.", buttons=build_main_menu_keyboard())
+			return
+
+		if decision != "start":
+			await event.answer("Некорректный выбор.", alert=True)
+			return
+
+		plan = state.plan
+		if plan is None:
+			run_manager.clear(user_id)
+			await event.edit("Не удалось подготовить материалы для рассылки. Попробуйте начать заново.", buttons=build_main_menu_keyboard())
+			return
+
+		run_manager.update(user_id, step=BroadcastRunStep.RUNNING, cancel_requested=False)
+		await event.edit("Рассылка запускается...", buttons=None)
+
+		initial_text = _build_progress_text(
+			"Рассылка запущена",
+			plan.total_groups,
+			0,
+			0,
+			0,
+			None,
+			None,
+			_estimate_remaining_seconds(plan.total_groups),
+		)
+		progress_message = await event.client.send_message(
+			user_id,
+			initial_text,
+			buttons=_build_progress_buttons(cancel_requested=False),
+		)
+
+		task = asyncio.create_task(
+			_execute_broadcast_plan(
+				context,
+				user_id,
+				plan,
+				progress_message.id,
+				bot_client=event.client,
+			)
+		)
+
+		def _log_task_result(future: asyncio.Future) -> None:
+			if future.cancelled():
+				return
+			exc = future.exception()
+			if exc is not None:
+				logger.exception("Ошибка фоновой задачи рассылки", exc_info=exc)
+
+		task.add_done_callback(_log_task_result)
+		run_manager.update(
+			user_id,
+			progress_message_id=progress_message.id,
+			task=task,
+		)
+
+	@client.on(events.CallbackQuery(pattern=rf"^{RUN_CANCEL_PREFIX}:".encode("utf-8")))
+	async def handle_broadcast_flow_cancel(event: events.CallbackQuery.Event) -> None:
+		user_id = event.sender_id
+		state = run_manager.get(user_id)
+		if state is None or (state.task and not state.task.done()):
+			await event.answer("Рассылка уже выполняется. Используйте кнопку «Отмена рассылки».", alert=True)
+			return
+
+		if not run_manager.has_active_flow(user_id):
+			await event.answer("Нечего отменять.", alert=True)
+			return
+
+		run_manager.clear(user_id)
+		await event.edit("Рассылка отменена.", buttons=build_main_menu_keyboard())
+
+	@client.on(events.CallbackQuery(pattern=rf"^{RUN_STOP_PREFIX}:".encode("utf-8")))
+	async def handle_broadcast_stop(event: events.CallbackQuery.Event) -> None:
+		user_id = event.sender_id
+		state = run_manager.get(user_id)
+		if state is None or state.step != BroadcastRunStep.RUNNING:
+			await event.answer("Рассылка не запущена.", alert=True)
+			return
+		if state.task is None or state.task.done():
+			await event.answer("Рассылка уже завершена.", alert=True)
+			return
+		if state.cancel_requested:
+			await event.answer("Отмена уже запрошена. Ожидайте завершения текущей отправки.", alert=True)
+			return
+
+		run_manager.update(user_id, cancel_requested=True)
+		await event.answer("Рассылка будет остановлена после текущей отправки.", alert=True)
+
 		@client.on(events.NewMessage(pattern=BROADCAST_PATTERN))
 		async def handle_broadcast_run_command(event: NewMessage.Event) -> None:
 			if not event.is_private:
@@ -1598,24 +1957,41 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 
 			user_id = event.sender_id
 			previous_setup = context.broadcast_manager.get(user_id)
+			state_snapshot = _describe_broadcast_flow_state(previous_setup)
 			if previous_setup and previous_setup.step != BroadcastStep.IDLE:
-				context.broadcast_manager.clear(user_id)
-				logger.info(
-					"Сбрасываем незавершённую настройку материалов перед запуском рассылки",
-					extra={"user_id": user_id},
+				_log_broadcast(
+					logging.INFO,
+					"Запуск рассылки заблокирован активным сценарием настройки материалов",
+					user_id=user_id,
+					current_state=state_snapshot,
 				)
+				await event.respond(
+					"Вы сейчас настраиваете материалы для рассылки. Завершите текущее действие или нажмите «Отмена», чтобы его прервать.",
+					buttons=[[Button.text(CANCEL_LABEL, resize=True)]],
+				)
+				return
+
 			run_state = run_manager.get(user_id)
 			if run_state:
 				if run_state.task and not run_state.task.done():
+					_log_broadcast(
+						logging.INFO,
+						"Запрос запуска отклонён: рассылка уже выполняется",
+						user_id=user_id,
+						run_state_step=run_state.step.value,
+						cancel_requested=run_state.cancel_requested,
+					)
 					await event.respond(
 						"Рассылка уже выполняется. Используйте кнопку «Отмена рассылки» в сообщении прогресса.",
 						buttons=build_main_menu_keyboard(),
 					)
 					return
 				if run_state.last_trigger_message_id == event.id:
-					logger.debug(
-						"Игнорируем повторный запуск рассылки для того же сообщения",
-						extra={"user_id": user_id, "message_id": event.id},
+					_log_broadcast(
+						logging.DEBUG,
+						"Повторный запуск рассылки проигнорирован",
+						user_id=user_id,
+						message_id=event.id,
 					)
 					return
 				run_manager.clear(user_id)
@@ -1632,11 +2008,48 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 
 			sessions = list(sessions_iter)
 			if not sessions:
+				_log_broadcast(
+					logging.INFO,
+					"Запуск рассылки отклонён: нет подключённых аккаунтов",
+					user_id=user_id,
+					current_state=state_snapshot,
+					sessions=[],
+					materials_available=False,
+				)
 				await event.respond(
-					"У вас нет подключённых аккаунтов. Подключите хотя бы один аккаунт, чтобы запустить рассылку.",
-					buttons=build_main_menu_keyboard(),
+					"Нельзя запустить рассылку: нет подключённых аккаунтов и/или нет сохранённого текста/картинки.\n\nУ вас нет подключённых аккаунтов. Подключите аккаунт командой /login_phone или /login_qr.",
+					buttons=_build_connect_account_keyboard(),
 				)
 				return
+
+			snapshot = _collect_session_materials_snapshot(sessions)
+			has_text = any(entry["has_text"] for entry in snapshot)
+			has_image = any(entry["has_image"] for entry in snapshot)
+			has_materials = any(entry["has_text"] or entry["has_image"] for entry in snapshot)
+
+			if not has_materials:
+				_log_broadcast(
+					logging.INFO,
+					"Запуск рассылки отклонён: нет материалов",
+					user_id=user_id,
+					current_state=state_snapshot,
+					sessions=snapshot,
+				)
+				await event.respond(
+					"Текст или картинка для рассылки не найдены. Используйте /add_text или /add_image.",
+					buttons=_build_missing_content_keyboard(),
+				)
+				return
+
+			_log_broadcast(
+				logging.INFO,
+				"Запуск рассылки: предварительные проверки пройдены",
+				user_id=user_id,
+				current_state=state_snapshot,
+				sessions=snapshot,
+				has_text=has_text,
+				has_image=has_image,
+			)
 
 			run_manager.begin(
 				user_id,
@@ -2256,3 +2669,4 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			modified,
 		)
 		await event.respond(config.success_message, buttons=build_main_menu_keyboard())
+

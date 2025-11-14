@@ -21,9 +21,16 @@ Boilerplate for a production-ready Telegram bot that manages multiple user accou
 
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
    ```
+
+   Activate the virtual environment:
+
+   - macOS/Linux (bash/zsh): `source .venv/bin/activate`
+   - Windows PowerShell: `.\.venv\Scripts\Activate.ps1`
+   - Windows Command Prompt: `.\.venv\Scripts\activate.bat`
+   - Windows Git Bash: `source .venv/Scripts/activate`
+
+   Once activated, install Python packages with `python -m pip install -r requirements.txt`.
 
 2. **Configure environment**
 
