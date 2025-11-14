@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     bot_session_name: str = Field(default="bot_session", alias="BOT_SESSION_NAME")
     user_collection: str = Field(default="users", alias="USER_COLLECTION")
     session_collection: str = Field(default="telethon_sessions", alias="SESSION_COLLECTION")
+    auto_task_collection: str = Field(default="auto_broadcast_tasks", alias="AUTO_TASK_COLLECTION")
+    auto_account_collection: str = Field(default="auto_accounts", alias="AUTO_ACCOUNT_COLLECTION")
+    auto_task_poll_interval_seconds: int = Field(default=15, alias="AUTO_TASK_POLL_INTERVAL")
+    auto_task_lock_ttl_seconds: int = Field(default=180, alias="AUTO_TASK_LOCK_TTL")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

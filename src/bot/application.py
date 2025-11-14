@@ -10,6 +10,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.auth_state import AuthStateManager
+from src.services.auto_broadcast import AutoBroadcastService
 from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
 
@@ -27,6 +28,7 @@ class BotApplication:
         user_repository: UserRepository,
         session_repository: SessionRepository,
         session_manager: TelethonSessionManager,
+        auto_broadcast_service: AutoBroadcastService,
     ) -> None:
         """Start the Telethon client and register command handlers."""
         if self._context is None:
@@ -45,6 +47,7 @@ class BotApplication:
                 broadcast_run_manager=broadcast_run_manager,
                 groups_manager=groups_manager,
                 group_view_manager=group_view_manager,
+                auto_broadcast_service=auto_broadcast_service,
             )
 
         await self._client.start(bot_token=self._bot_token)

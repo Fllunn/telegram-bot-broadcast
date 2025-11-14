@@ -87,6 +87,7 @@ def _state_snapshot(states: Dict[str, object]) -> Dict[str, object]:
         "broadcast_run_step": getattr(getattr(states.get("broadcast_run"), "step", None), "value", None),
         "group_upload_step": getattr(getattr(states.get("group_upload"), "step", None), "value", None),
         "group_view_step": getattr(getattr(states.get("group_view"), "step", None), "value", None),
+        "auto_task_step": getattr(getattr(states.get("auto_task"), "step", None), "value", None),
     }
 
 
@@ -98,6 +99,7 @@ async def _handle_cancel(event, *, context: BotContext, source: str) -> None:
     broadcast_run_state = context.broadcast_run_manager.clear(user_id)
     group_upload_state = context.groups_manager.clear(user_id)
     group_view_state = context.group_view_manager.clear(user_id)
+    auto_task_state = context.auto_broadcast_service.state_manager.clear(user_id)
 
     states = {
         "auth": auth_state,
@@ -105,6 +107,7 @@ async def _handle_cancel(event, *, context: BotContext, source: str) -> None:
         "broadcast_run": broadcast_run_state,
         "group_upload": group_upload_state,
         "group_view": group_view_state,
+        "auto_task": auto_task_state,
     }
 
     snapshot = _state_snapshot(states)
@@ -124,6 +127,7 @@ async def _handle_cancel(event, *, context: BotContext, source: str) -> None:
     await _cleanup_broadcast_run(context, client, user_id, broadcast_run_state)
     await _cleanup_group_upload(client, user_id, group_upload_state)
     await _cleanup_group_view(client, user_id, group_view_state)
+    await _maybe_remove_inline_keyboard(client, user_id, getattr(auto_task_state, "last_message_id", None))
 
     if isinstance(event, CallbackQuery.Event):
         with contextlib.suppress(Exception):
