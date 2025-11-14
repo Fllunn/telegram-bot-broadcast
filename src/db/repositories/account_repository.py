@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Iterable, List, Optional
 
@@ -24,7 +25,28 @@ class AccountRepository:
     def _deserialize(document: Optional[dict]) -> Optional[AccountState]:
         if document is None:
             return None
-        return AccountState.model_validate(document)
+        return AccountRepository._validate_document(document)
+
+    @staticmethod
+    def _validate_document(document: dict) -> AccountState:
+        normalized = AccountRepository._stringify_object_id(document)
+        return AccountState.model_validate(normalized)
+
+    @staticmethod
+    def _stringify_object_id(document: dict) -> dict:
+        if document is None:
+            return {}
+        copy = dict(document)
+        raw_id = copy.get("_id")
+        if raw_id is not None and not isinstance(raw_id, str):
+            try:
+                copy["_id"] = str(raw_id)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logging.getLogger(__name__).warning(
+                    "Failed to stringify account document _id", exc_info=exc
+                )
+                copy["_id"] = repr(raw_id)
+        return copy
 
     async def upsert_account(
         self,
@@ -58,7 +80,7 @@ class AccountRepository:
         )
         if document is None:
             raise RuntimeError("Failed to upsert account state")
-        return AccountState.model_validate(document)
+        return self._validate_document(document)
 
     async def get_by_account_id(self, account_id: str) -> Optional[AccountState]:
         document = await self._collection.find_one({"account_id": account_id})
@@ -68,7 +90,7 @@ class AccountRepository:
         cursor = self._collection.find({"owner_id": owner_id})
         states: List[AccountState] = []
         async for document in cursor:
-            states.append(AccountState.model_validate(document))
+            states.append(self._validate_document(document))
         return states
 
     async def mark_cooldown(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
@@ -15,6 +16,7 @@ class AutoBroadcastTaskRepository:
 
     def __init__(self, database: AsyncIOMotorDatabase, collection_name: str) -> None:
         self._collection: AsyncIOMotorCollection = database.get_collection(collection_name)
+        self._logger = logging.getLogger(__name__)
 
     async def ensure_indexes(self) -> None:
         await self._collection.create_index("task_id", unique=True)
@@ -27,7 +29,22 @@ class AutoBroadcastTaskRepository:
     def _deserialize(document: Optional[dict]) -> Optional[AutoBroadcastTask]:
         if document is None:
             return None
-        return AutoBroadcastTask.model_validate(document)
+        return AutoBroadcastTask.model_validate(AutoBroadcastTaskRepository._stringify_object_id(document))
+
+    @classmethod
+    def _stringify_object_id(cls, document: dict) -> dict:
+        if document is None:
+            return {}
+        normalized = dict(document)
+        if "_id" in normalized and normalized["_id"] is not None and not isinstance(normalized["_id"], str):
+            try:
+                normalized["_id"] = str(normalized["_id"])
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logging.getLogger(__name__).warning(
+                    "Failed to stringify task document _id", exc_info=exc
+                )
+                normalized["_id"] = repr(normalized["_id"])
+        return normalized
 
     async def create_task(self, task: AutoBroadcastTask) -> AutoBroadcastTask:
         payload = task.model_dump(by_alias=True, exclude_none=True)
@@ -38,7 +55,7 @@ class AutoBroadcastTaskRepository:
             result = await self._collection.insert_one(payload)
         except DuplicateKeyError as exc:  # pragma: no cover - motor translates unique index violation
             raise ValueError(f"Task with id {task.task_id} already exists") from exc
-        payload["_id"] = result.inserted_id
+        payload["_id"] = str(result.inserted_id)
         return AutoBroadcastTask.model_validate(payload)
 
     async def replace_task(self, task: AutoBroadcastTask) -> AutoBroadcastTask:
@@ -52,7 +69,7 @@ class AutoBroadcastTaskRepository:
         )
         if document is None:
             raise ValueError(f"Task {task.task_id} not found for replacement")
-        return AutoBroadcastTask.model_validate(document)
+        return AutoBroadcastTask.model_validate(self._stringify_object_id(document))
 
     async def get_by_task_id(self, task_id: str) -> Optional[AutoBroadcastTask]:
         document = await self._collection.find_one({"task_id": task_id})
@@ -62,7 +79,7 @@ class AutoBroadcastTaskRepository:
         cursor = self._collection.find({"user_id": user_id}).sort("created_at", 1)
         tasks: List[AutoBroadcastTask] = []
         async for document in cursor:
-            tasks.append(AutoBroadcastTask.model_validate(document))
+            tasks.append(AutoBroadcastTask.model_validate(self._stringify_object_id(document)))
         return tasks
 
     async def list_active_tasks(self) -> List[AutoBroadcastTask]:
@@ -74,7 +91,7 @@ class AutoBroadcastTaskRepository:
         )
         tasks: List[AutoBroadcastTask] = []
         async for document in cursor:
-            tasks.append(AutoBroadcastTask.model_validate(document))
+            tasks.append(AutoBroadcastTask.model_validate(self._stringify_object_id(document)))
         return tasks
 
     async def acquire_lock(self, task_id: str, worker_id: str, lock_ttl_seconds: int) -> Optional[AutoBroadcastTask]:
@@ -185,7 +202,7 @@ class AutoBroadcastTaskRepository:
         if document is None:
             return None
 
-        task = AutoBroadcastTask.model_validate(document)
+        task = AutoBroadcastTask.model_validate(self._stringify_object_id(document))
         cycles_completed = task.cycles_completed + 1
         total_sent = task.total_sent + totals_sent_delta
         total_failed = task.total_failed + totals_failed_delta

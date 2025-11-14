@@ -49,6 +49,8 @@ class AutoBroadcastSupervisor:
         lock_ttl_seconds: int,
         poll_interval: float,
         max_delay_per_message: int,
+        batch_pause_max_seconds: float,
+        interval_safety_margin_seconds: float,
         max_restart_attempts: int = 5,
         base_backoff: float = 5.0,
         max_backoff: float = 300.0,
@@ -62,6 +64,8 @@ class AutoBroadcastSupervisor:
         self._lock_ttl = lock_ttl_seconds
         self._poll_interval = poll_interval
         self._max_delay = max_delay_per_message
+        self._batch_pause_max = batch_pause_max_seconds
+        self._interval_margin = interval_safety_margin_seconds
         self._max_restart_attempts = max_restart_attempts
         self._base_backoff = base_backoff
         self._max_backoff = max_backoff
@@ -136,6 +140,8 @@ class AutoBroadcastSupervisor:
             worker_id=self._worker_id,
             lock_ttl_seconds=int(self._lock_ttl),
             max_delay_per_message=self._max_delay,
+            batch_pause_max_seconds=self._batch_pause_max,
+            interval_safety_margin_seconds=self._interval_margin,
         )
         runner_task = asyncio.create_task(runner.run())
         handle = RunnerHandle(runner=runner, task=runner_task, latest_snapshot=task)
