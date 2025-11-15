@@ -14,6 +14,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.models.auto_broadcast import AccountMode, AccountStatus, AutoBroadcastTask, GroupTarget, TaskStatus
 from src.models.session import TelethonSession
 from src.services.auto_broadcast.state_manager import AutoTaskStateManager
+from src.services.auto_broadcast.intervals import MAX_INTERVAL_SECONDS, NORMALIZED_MAX_INTERVAL
 from src.services.auto_broadcast.supervisor import AutoBroadcastSupervisor
 from src.services.auto_broadcast.payloads import extract_image_metadata
 from src.services.telethon_manager import TelethonSessionManager
@@ -186,6 +187,9 @@ class AutoBroadcastService:
         if not math.isfinite(user_interval_seconds) or user_interval_seconds <= 0:
             raise ValueError("Укажите корректный интервал между циклами")
 
+        if user_interval_seconds > MAX_INTERVAL_SECONDS:
+            raise ValueError(f"Интервал слишком большой. Максимум — {NORMALIZED_MAX_INTERVAL}.")
+
         groups_by_account = self._extract_groups(sessions)
         total_groups = sum(len(groups) for groups in groups_by_account.values())
         if total_groups == 0:
@@ -220,6 +224,12 @@ class AutoBroadcastService:
         minimum_interval = self._calculate_minimum_interval(groups_by_account, batch_size)
         if user_interval_seconds <= minimum_interval:
             raise InvalidIntervalError(minimum_interval)
+
+        if minimum_interval > MAX_INTERVAL_SECONDS:
+            raise ValueError(
+                "Минимальный безопасный интервал для выбранных параметров превышает лимит {0}. "
+                "Уменьшите количество групп или разбейте рассылку на несколько задач.".format(NORMALIZED_MAX_INTERVAL)
+            )
 
         self._default_batch_size = max(1, batch_size)
 

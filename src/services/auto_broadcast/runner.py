@@ -7,7 +7,7 @@ import math
 import random
 import time
 from datetime import datetime, timedelta
-from typing import Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Iterable, List, Mapping, Optional, Set, Tuple
 
 from telethon import TelegramClient
 from telethon.errors.rpcerrorlist import (
@@ -43,7 +43,6 @@ from src.utils.timezone import format_moscow_time
 
 logger = logging.getLogger(__name__)
 
-ANTISPAM_SUFFIXES: Sequence[str] = ("\u2060", "\u200B", "\u200C", " .", " …", " 🙂")
 SHUFFLE_RANDOM = random.SystemRandom()
 AUTH_ERRORS: Tuple[type[BaseException], ...] = (
     AuthKeyUnregisteredError,
@@ -645,7 +644,7 @@ class AutoBroadcastRunner:
                     if self._stop_event.is_set() or session_inactive:
                         break
 
-                    payload_text = self._append_suffix(text)
+                    payload_text = text
                     success, reason = await send_payload_to_group(
                         session_client=client,
                         entity=target.entity,
@@ -750,12 +749,6 @@ class AutoBroadcastRunner:
             file_name=image_payload.file_name,
             mime_type=image_payload.mime_type,
         )
-
-    @staticmethod
-    def _append_suffix(text: Optional[str]) -> Optional[str]:
-        if not text:
-            return text
-        return f"{text}{random.choice(ANTISPAM_SUFFIXES)}"
 
     async def _sleep_between_messages(self, message_counter: int, batch_size: int) -> None:
         if self._stop_event.is_set():

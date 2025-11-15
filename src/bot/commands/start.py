@@ -5,7 +5,7 @@ from telethon.events import NewMessage
 
 from src.bot.context import BotContext
 from src.models.user import User
-from src.bot.keyboards import build_main_menu_keyboard
+from src.bot.keyboards import AUTO_STATUS_LABEL, build_main_menu_keyboard
 
 
 def setup_start_command(client, context: BotContext) -> None:
@@ -29,7 +29,7 @@ def setup_start_command(client, context: BotContext) -> None:
                 "Привет! Я помогу подключить и управлять несколькими аккаунтами."
                 "\nИспользуйте кнопки ниже или команды /help, /login_phone, /login_qr, /accounts, /add_text, /add_image, /view_broadcast, /upload_groups, /broadcast."
                 "\nКоманда /view_groups покажет сохранённые списки групп."
-                "\nДля автозадач используйте кнопки 'Автозадача', 'Остановить авторассылку' или команду /auto_status."
+                f"\nДля автозадач используйте кнопки 'Автозадача', 'Остановить авторассылку' или {AUTO_STATUS_LABEL}."
             ),
             buttons=build_main_menu_keyboard(),
         )

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
-import random
 from dataclasses import dataclass
 from functools import partial
 from io import BytesIO

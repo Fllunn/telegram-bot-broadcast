@@ -30,6 +30,7 @@ class AutoTaskSetupState:
     account_groups: Dict[str, List[object]] = field(default_factory=dict)
     total_groups: int = 0
     user_interval_seconds: Optional[float] = None
+    user_interval_text: Optional[str] = None
     notify_each_cycle: bool = False
     batch_size: int = 20
     last_message_id: Optional[int] = None

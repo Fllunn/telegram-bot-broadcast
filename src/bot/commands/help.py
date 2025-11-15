@@ -4,6 +4,7 @@ from telethon import events
 from telethon.events import NewMessage
 
 from src.bot.context import BotContext
+from src.bot.keyboards import AUTO_STATUS_LABEL
 
 
 def setup_help_command(client, context: BotContext) -> None:
@@ -25,7 +26,7 @@ def setup_help_command(client, context: BotContext) -> None:
                 "8. /broadcast — запустить рассылку с учётом настроенных пауз и выбранных аккаунтов.\n"
                 "9. Кнопка 'Автозадача' — запустить мастер создания периодической рассылки.\n"
                 "10. Кнопка 'Остановить авторассылку' — выбрать и остановить автозадачу без ввода Task ID.\n"
-                "11. /auto_status — посмотреть активные автозадачи и их состояние.\n"
+                f"11. Кнопка {AUTO_STATUS_LABEL} — посмотреть активные автозадачи и их состояние.\n"
                 "Команда /accounts покажет подключённые аккаунты."
             )
         )

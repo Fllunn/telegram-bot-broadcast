@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,10 +11,17 @@ from telethon import Button, events
 from telethon.events import CallbackQuery, NewMessage
 
 from src.bot.context import BotContext
-from src.bot.keyboards import STOP_AUTO_LABEL, build_main_menu_keyboard
+from src.bot.keyboards import AUTO_STATUS_LABEL, STOP_AUTO_LABEL, build_main_menu_keyboard
 from src.models.auto_broadcast import AccountMode, AutoBroadcastTask, GroupTarget, TaskStatus
 from src.services.auto_broadcast.engine import AccountInUseError, InvalidIntervalError
 from src.services.auto_broadcast.payloads import extract_image_metadata
+from src.services.auto_broadcast.intervals import (
+    MAX_INTERVAL_SECONDS,
+    NORMALIZED_MAX_INTERVAL,
+    IntervalValidationError,
+    format_interval_hms,
+    parse_interval_input,
+)
 from src.services.auto_broadcast.state_manager import (
     AutoTaskSetupState,
     AutoTaskSetupStep,
@@ -26,7 +32,7 @@ from src.utils.timezone import format_moscow_time
 logger = logging.getLogger(__name__)
 
 AUTO_SCHEDULE_PATTERN = r"^(?:/auto_schedule(?:@\w+)?|Авторассылка)$"
-AUTO_STATUS_PATTERN = r"^/auto_status(?:@\w+)?$"
+AUTO_STATUS_PATTERN = rf"^(?:/auto_status(?:@\w+)?|{re.escape(AUTO_STATUS_LABEL)})$"
 AUTO_PAUSE_PATTERN = r"^/auto_pause(?:@\w+)?(\s+\S+)?$"
 AUTO_RESUME_PATTERN = r"^/auto_resume(?:@\w+)?(\s+\S+)?$"
 AUTO_STOP_PATTERN = r"^/auto_stop(?:@\w+)?(\s+\S+)?$"
@@ -82,8 +88,8 @@ TASK_ACTIONS: Dict[str, TaskActionMeta] = {
 }
 
 INTERVAL_HELP = (
-    "Укажите интервал между циклами рассылки. Можно вводить в секундах или в формате ЧЧ:ММ:СС.\n"
-    "Интервал должен быть больше рассчётного минимума, чтобы сообщения не перекрывались."
+    "Укажите интервал между циклами рассылки в формате ЧЧ:ММ:СС (например, 01:30:00).\n"
+    f"Максимум — {NORMALIZED_MAX_INTERVAL} (7 дней). Интервал должен быть больше расчётного минимума, чтобы сообщения не перекрывались."
 )
 
 
@@ -220,36 +226,6 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             ],
         )
         state_manager.update(event.sender_id, last_message_id=message.id)
-
-    def _parse_interval_seconds(text: str) -> Optional[float]:
-        normalized = text.strip()
-        if not normalized:
-            return None
-        if ":" in normalized:
-            parts = normalized.split(":")
-            if len(parts) == 3:
-                hours, minutes, seconds = parts
-            elif len(parts) == 2:
-                hours = "0"
-                minutes, seconds = parts
-            else:
-                return None
-            try:
-                total = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-                if total <= 0:
-                    return None
-                return float(total)
-            except ValueError:
-                return None
-        else:
-            try:
-                candidate = normalized.replace(",", ".")
-                value = float(candidate)
-                if not math.isfinite(value) or value <= 0:
-                    return None
-                return value
-            except ValueError:
-                return None
 
     def _status_descriptor(status: TaskStatus) -> tuple[str, str]:
         mapping = {
@@ -414,7 +390,9 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
 
     def _format_task_summary(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
         icon, status_text = _status_descriptor(task.status)
+        interval_hms = format_interval_hms(task.user_interval_seconds)
         interval_text = service.humanize_interval(task.user_interval_seconds)
+        interval_label = f"Интервал: {interval_hms} ({interval_text})" if interval_hms != "—" else f"Интервал: {interval_text}"
         next_run_text = _format_next_run_compact(task.next_run_ts)
         account_ids = _collect_task_account_ids(task)
         account_labels = [labels.get(account_id, "Аккаунт недоступен") for account_id in account_ids]
@@ -433,7 +411,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             [
                 f"{icon} {status_text}",
                 account_line,
-                f"Интервал: {interval_text}",
+                interval_label,
                 f"Следующий запуск: {next_run_text}",
                 stats_line,
             ]
@@ -443,12 +421,14 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         icon, status_text = _status_descriptor(task.status)
         mode_text = "Все аккаунты" if task.account_mode == AccountMode.ALL else "Один аккаунт"
         accounts_text = _format_account_list(task, labels)
+        interval_hms = format_interval_hms(task.user_interval_seconds)
         interval_text = service.humanize_interval(task.user_interval_seconds)
+        interval_display = f"{interval_hms} ({interval_text})" if interval_hms != "—" else interval_text
         next_run_text = _humanize_next_run(task.next_run_ts, with_exact=False)
         notify_icon = "🔔" if task.notify_each_cycle else "🔕"
         return (
             f"{icon} {mode_text} • {accounts_text}\n"
-            f"   Интервал: {interval_text} • Следующий запуск: {next_run_text} • {notify_icon}"
+            f"   Интервал: {interval_display} • Следующий запуск: {next_run_text} • {notify_icon}"
         )
 
     def _build_task_button_label(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
@@ -580,12 +560,18 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             account_count = len(state.available_account_ids)
             account_line = f"{account_count} аккаунтов"
         notify_line = "Включены" if state.notify_each_cycle else "Выключены"
-        interval = service.humanize_interval(state.user_interval_seconds or 0)
+        interval_seconds = state.user_interval_seconds or 0
+        normalized_interval = state.user_interval_text or format_interval_hms(interval_seconds)
+        if interval_seconds > 0:
+            humanized_interval = service.humanize_interval(interval_seconds)
+            interval_line = f"Интервал между циклами: {normalized_interval} ({humanized_interval})"
+        else:
+            interval_line = f"Интервал между циклами: {normalized_interval}"
         return (
             "Проверьте параметры авторассылки:\n"
             f"Режим: {'все аккаунты' if state.account_mode == AccountMode.ALL else 'один аккаунт'}\n"
             f"Аккаунты: {account_line}\n"
-            f"Интервал между циклами: {interval}\n"
+            f"{interval_line}\n"
             f"Уведомления: {notify_line}\n\n"
             "Нажмите 'Создать', чтобы запустить авторассылку."
         )
@@ -707,17 +693,30 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         state = state_manager.get(event.sender_id)
         if state is None:
             return
-        seconds = _parse_interval_seconds(event.raw_text or "")
-        if seconds is None or seconds <= 0:
-            await event.respond("Некорректное значение. Укажите положительный интервал.")
+        try:
+            parsed = parse_interval_input(event.raw_text or "")
+        except IntervalValidationError as exc:
+            await event.respond(exc.user_message)
             return
+        seconds = float(parsed.total_seconds)
         minimum = _minimum_seconds_for_state(event.sender_id, state)
+        if minimum > MAX_INTERVAL_SECONDS:
+            await event.respond(
+                f"Минимальный безопасный интервал для выбранных параметров превышает лимит {NORMALIZED_MAX_INTERVAL}. "
+                "Уменьшите количество групп или разделите рассылку на несколько задач."
+            )
+            return
         if seconds <= minimum:
             await event.respond(
                 "Минимально допустимое время — {0}. Укажите больше.".format(service.humanize_interval(minimum))
             )
             return
-        state_manager.update(event.sender_id, user_interval_seconds=seconds, step=AutoTaskSetupStep.CONFIRMATION)
+        state_manager.update(
+            event.sender_id,
+            user_interval_seconds=seconds,
+            user_interval_text=parsed.normalized_text,
+            step=AutoTaskSetupStep.CONFIRMATION,
+        )
         notify_state = state_manager.get(event.sender_id)
         buttons = [
             [Button.inline("✅ Создать", f"{CONFIRM_CALLBACK}:create".encode("utf-8"))],
@@ -888,7 +887,10 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             await event.answer("Задача не найдена или недоступна.", alert=True)
             with contextlib.suppress(Exception):
                 await event.edit("Задача не найдена или недоступна.")
-            await event.respond("Не удалось найти выбранную автозадачу. Попробуйте обновить список через /auto_status.", buttons=build_main_menu_keyboard())
+            await event.respond(
+                f"Не удалось найти выбранную автозадачу. Попробуйте обновить список через {AUTO_STATUS_LABEL}.",
+                buttons=build_main_menu_keyboard(),
+            )
             return
         await event.answer("Готово.")
         labels = await _build_account_label_map(event.sender_id, [task])

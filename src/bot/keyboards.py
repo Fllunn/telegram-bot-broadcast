@@ -13,6 +13,7 @@ VIEW_GROUPS_LABEL = "Просмотреть группы для рассылки
 BROADCAST_LABEL = "Запустить рассылку"
 AUTO_TASK_LABEL = "Авторассылка"
 STOP_AUTO_LABEL = "Остановить авторассылку"
+AUTO_STATUS_LABEL = "Статус авторассылки"
 
 
 def build_main_menu_keyboard() -> list[list[Button]]:
@@ -36,6 +37,6 @@ def build_main_menu_keyboard() -> list[list[Button]]:
         [
             Button.text(AUTO_TASK_LABEL, resize=True),
             Button.text(STOP_AUTO_LABEL, resize=True),
-            Button.text("/auto_status", resize=True),
+            Button.text(AUTO_STATUS_LABEL, resize=True),
         ],
     ]
