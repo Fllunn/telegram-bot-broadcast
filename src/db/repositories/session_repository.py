@@ -54,6 +54,17 @@ class SessionRepository:
         normalized = self._normalize_document(document)
         return TelethonSession.model_validate(normalized)
 
+    async def get_by_session_ids(self, session_ids: Sequence[str]) -> list[TelethonSession]:
+        ids = [session_id for session_id in session_ids if session_id]
+        if not ids:
+            return []
+        cursor = self._collection.find({"session_id": {"$in": ids}})
+        sessions: list[TelethonSession] = []
+        async for document in cursor:
+            normalized = self._normalize_document(document)
+            sessions.append(TelethonSession.model_validate(normalized))
+        return sessions
+
     async def get_active_sessions_for_owner(
         self,
         owner_id: int,

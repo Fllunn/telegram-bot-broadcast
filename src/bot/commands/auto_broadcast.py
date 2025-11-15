@@ -6,13 +6,13 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Mapping
+from typing import Dict, List, Optional, Mapping, Sequence
 
 from telethon import Button, events
 from telethon.events import CallbackQuery, NewMessage
 
 from src.bot.context import BotContext
-from src.bot.keyboards import build_main_menu_keyboard
+from src.bot.keyboards import STOP_AUTO_LABEL, build_main_menu_keyboard
 from src.models.auto_broadcast import AccountMode, AutoBroadcastTask, GroupTarget, TaskStatus
 from src.services.auto_broadcast.engine import InvalidIntervalError
 from src.services.auto_broadcast.payloads import extract_image_metadata
@@ -31,6 +31,7 @@ AUTO_RESUME_PATTERN = r"^/auto_resume(?:@\w+)?(\s+\S+)?$"
 AUTO_STOP_PATTERN = r"^/auto_stop(?:@\w+)?(\s+\S+)?$"
 AUTO_NOTIFY_ON_PATTERN = r"^/auto_notify_on(?:@\w+)?(\s+\S+)?$"
 AUTO_NOTIFY_OFF_PATTERN = r"^/auto_notify_off(?:@\w+)?(\s+\S+)?$"
+STOP_AUTO_PATTERN = rf"^(?:{re.escape(STOP_AUTO_LABEL)})$"
 
 MODE_CALLBACK = "auto_mode"
 SELECT_CALLBACK = "auto_select"
@@ -38,6 +39,14 @@ CONFIRM_CALLBACK = "auto_confirm"
 NOTIFY_CALLBACK = "auto_notify"
 CANCEL_CALLBACK = "auto_cancel"
 TASK_ACTION_CALLBACK = "auto_task_action"
+STOP_MENU_CALLBACK = "auto_stop_menu"
+
+STOP_SINGLE_OPTION = "single"
+STOP_ALL_OPTION = "all"
+
+STOP_MENU_PROMPT = "Выберите тип автозадач для остановки:"
+STOP_SINGLE_LABEL = "Остановить автозадачу одного аккаунта"
+STOP_ALL_LABEL = "Остановить автозадачу всех аккаунтов"
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,13 @@ INTERVAL_HELP = (
 def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     service = context.auto_broadcast_service
     state_manager = service.state_manager
+
+    def _stop_menu_buttons() -> List[List[Button]]:
+        return [
+            [Button.inline(STOP_SINGLE_LABEL, f"{STOP_MENU_CALLBACK}:{STOP_SINGLE_OPTION}".encode("utf-8"))],
+            [Button.inline(STOP_ALL_LABEL, f"{STOP_MENU_CALLBACK}:{STOP_ALL_OPTION}".encode("utf-8"))],
+            [Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))],
+        ]
 
     async def _render_mode_prompt(event: NewMessage.Event, sessions) -> None:
         counts: Dict[str, int] = {}
@@ -255,30 +271,85 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return trimmed
         return f"ID {trimmed[:3]}…{trimmed[-2:]}"
 
+    def _normalize_username_label(username: Optional[str]) -> Optional[str]:
+        if not username:
+            return None
+        value = str(username).strip().lstrip("@")
+        if not value:
+            return None
+        return f"@{value}"
+
+    def _normalize_phone_label(phone: Optional[str]) -> Optional[str]:
+        if not phone:
+            return None
+        digits = "".join(ch for ch in str(phone).strip() if ch not in {" ", "-", "(" , ")"})
+        if not digits:
+            return None
+        normalized = digits if digits.startswith("+") else f"+{digits.lstrip('+')}"
+        if len(normalized) < 4:
+            return None
+        return normalized
+
+    def _session_account_label(session) -> str:
+        metadata = session.metadata or {}
+        username = metadata.get("username") if isinstance(metadata, Mapping) else None
+        label = _normalize_username_label(username)
+        if label:
+            return label
+        phone_source = getattr(session, "phone", None)
+        if not phone_source and isinstance(metadata, Mapping):
+            phone_source = metadata.get("phone")
+        phone_label = _normalize_phone_label(phone_source)
+        if phone_label:
+            return phone_label
+        return "Аккаунт без данных"
+
+    def _deduplicate_preserve_order(values: Sequence[str]) -> List[str]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
+    def _collect_task_account_ids(task: AutoBroadcastTask) -> List[str]:
+        candidates: List[str] = []
+        if task.account_mode == AccountMode.SINGLE and task.account_id:
+            candidates.append(task.account_id)
+        candidates.extend(task.account_ids or [])
+        if task.current_account_id:
+            candidates.append(task.current_account_id)
+        return _deduplicate_preserve_order(candidates)
+
     async def _build_account_label_map(
         user_id: int,
         tasks: Optional[List[AutoBroadcastTask]] = None,
     ) -> Dict[str, str]:
         sessions = await service.load_active_sessions(user_id, ensure_fresh_metadata=True)
-        labels: Dict[str, str] = {session.session_id: session.display_name() for session in sessions}
+        labels: Dict[str, str] = {session.session_id: _session_account_label(session) for session in sessions}
         if tasks:
+            required_ids: List[str] = []
             for task in tasks:
-                for account_id in task.account_ids or []:
-                    labels.setdefault(account_id, _short_account_id(account_id))
-                if task.account_id:
-                    labels.setdefault(task.account_id, _short_account_id(task.account_id))
-                if task.current_account_id:
-                    labels.setdefault(task.current_account_id, _short_account_id(task.current_account_id))
+                required_ids.extend(_collect_task_account_ids(task))
+            required_ids = _deduplicate_preserve_order(required_ids)
+            missing_ids = [account_id for account_id in required_ids if account_id not in labels]
+            if missing_ids:
+                extra_sessions = await context.session_repository.get_by_session_ids(missing_ids)
+                for session in extra_sessions:
+                    if session.owner_id != user_id:
+                        continue
+                    labels[session.session_id] = _session_account_label(session)
+            for account_id in required_ids:
+                labels.setdefault(account_id, "Аккаунт недоступен")
         return labels
 
     def _format_account_list(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
-        if task.account_mode == AccountMode.SINGLE and task.account_id:
-            account_ids = [task.account_id]
-        else:
-            account_ids = task.account_ids or []
+        account_ids = _collect_task_account_ids(task)
         if not account_ids:
             return "—"
-        names = [labels.get(account_id, _short_account_id(account_id)) for account_id in account_ids]
+        names = [labels.get(account_id, "Аккаунт недоступен") for account_id in account_ids]
         if len(names) > 3:
             remaining = len(names) - 3
             base = ", ".join(names[:3])
@@ -286,15 +357,13 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         return ", ".join(names)
 
     def _primary_account_label(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
-        if task.account_mode == AccountMode.SINGLE and task.account_id:
-            return labels.get(task.account_id, _short_account_id(task.account_id))
-        account_ids = task.account_ids or []
+        account_ids = _collect_task_account_ids(task)
+        if not account_ids:
+            return "—"
+        primary_label = labels.get(account_ids[0], "Аккаунт недоступен")
         if len(account_ids) == 1:
-            account_id = account_ids[0]
-            return labels.get(account_id, _short_account_id(account_id))
-        if account_ids:
-            return f"{len(account_ids)} акк."
-        return "—"
+            return primary_label
+        return f"{primary_label} +{len(account_ids) - 1}"
 
     def _humanize_seconds(seconds: float) -> str:
         total = int(max(0, round(seconds)))
@@ -327,40 +396,35 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return relative
         return f"{relative} ({next_run:%d.%m %H:%M})"
 
-    def _format_task_progress(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
-        account_id = task.current_account_id
-        if not account_id:
-            return "ожидает запуска"
-        account_label = labels.get(account_id, _short_account_id(account_id))
-        groups = task.per_account_groups.get(account_id) or task.groups
-        total_groups = len(groups)
-        if total_groups <= 0:
-            return f"{account_label}: нет групп"
-        current_group = min(max(1, task.current_group_index + 1), total_groups)
-        batch_size = max(1, task.batch_size)
-        total_batches = max(1, math.ceil(total_groups / batch_size))
-        current_batch = min(max(1, task.current_batch_index + 1), total_batches)
-        return f"{account_label}: группа {current_group}/{total_groups}, батч {current_batch}/{total_batches}"
+    def _format_next_run_compact(next_run: Optional[datetime]) -> str:
+        if next_run is None:
+            return "—"
+        return f"{next_run:%d.%m %H:%M}"
 
     def _format_task_summary(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
         icon, status_text = _status_descriptor(task.status)
-        mode_text = "все аккаунты" if task.account_mode == AccountMode.ALL else "один аккаунт"
-        accounts_text = _format_account_list(task, labels)
         interval_text = service.humanize_interval(task.user_interval_seconds)
-        next_run_text = _humanize_next_run(task.next_run_ts)
-        progress_text = _format_task_progress(task, labels)
-        notify_text = "включены" if task.notify_each_cycle else "выключены"
-        stats_text = f"✅ {task.total_sent} • ⚠️ {task.total_failed}"
+        next_run_text = _format_next_run_compact(task.next_run_ts)
+        account_ids = _collect_task_account_ids(task)
+        account_labels = [labels.get(account_id, "Аккаунт недоступен") for account_id in account_ids]
+        if not account_labels:
+            account_line = "Аккаунт: недоступен"
+        elif len(account_labels) == 1:
+            account_line = f"Аккаунт: {account_labels[0]}"
+        else:
+            display = ", ".join(account_labels[:3])
+            remaining = len(account_labels) - 3
+            if remaining > 0:
+                display = f"{display} +{remaining}"
+            account_line = f"Аккаунты: {display}"
+        stats_line = f"Статистика: {task.total_sent} отправлено, {task.total_failed} ошибок"
         return "\n".join(
             [
-                f"{icon} {status_text} • {mode_text}",
-                f"Аккаунты: {accounts_text}",
+                f"{icon} {status_text}",
+                account_line,
                 f"Интервал: {interval_text}",
                 f"Следующий запуск: {next_run_text}",
-                f"Прогресс: {progress_text}",
-                f"Уведомления: {notify_text}",
-                f"Статистика: {stats_text}",
-                f"ID: `{task.task_id}`",
+                stats_line,
             ]
         )
 
@@ -382,6 +446,48 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         next_run = _humanize_next_run(task.next_run_ts, with_exact=False)
         return f"{icon} {primary} • {next_run}"
 
+    def _format_stop_menu_line(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
+        accounts_text = _format_account_list(task, labels)
+        interval_text = service.humanize_interval(task.user_interval_seconds)
+        return f"{accounts_text} — {interval_text}"
+
+    def _build_stop_option_label(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
+        accounts_text = _primary_account_label(task, labels)
+        interval_text = service.humanize_interval(task.user_interval_seconds)
+        return f"{accounts_text} • {interval_text}"
+
+    async def _render_stop_task_selector(event: CallbackQuery.Event, mode: AccountMode) -> None:
+        meta = TASK_ACTIONS["stop"]
+        tasks = await service.list_tasks_for_user(event.sender_id)
+        applicable = [task for task in tasks if _is_task_applicable(task, "stop") and task.account_mode == mode]
+        if not applicable:
+            buttons = [
+                [Button.inline("« Назад", f"{STOP_MENU_CALLBACK}:back".encode("utf-8"))],
+                [Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))],
+            ]
+            with contextlib.suppress(Exception):
+                await event.edit(meta.empty_text, buttons=buttons)
+            return
+
+        labels = await _build_account_label_map(event.sender_id, applicable)
+        header = "Выберите автозадачу для остановки:" if mode == AccountMode.SINGLE else "Выберите общую автозадачу для остановки:"
+        lines = [header]
+        for idx, task in enumerate(applicable, start=1):
+            lines.append(f"{idx}. {_format_stop_menu_line(task, labels)}")
+        buttons = [
+            [
+                Button.inline(
+                    _build_stop_option_label(task, labels),
+                    f"{TASK_ACTION_CALLBACK}:stop:{task.task_id}".encode("utf-8"),
+                )
+            ]
+            for task in applicable
+        ]
+        buttons.append([Button.inline("« Назад", f"{STOP_MENU_CALLBACK}:back".encode("utf-8"))])
+        buttons.append([Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))])
+        with contextlib.suppress(Exception):
+            await event.edit("\n".join(lines), buttons=buttons)
+
     def _is_task_applicable(task: AutoBroadcastTask, action: str) -> bool:
         if action == "pause":
             return task.status == TaskStatus.RUNNING and task.enabled
@@ -399,17 +505,24 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         current = await service.get_task(task_id)
         if current is None or current.user_id != user_id:
             return None
-        if action == "pause":
-            updated = await service.pause_task(task_id)
-        elif action == "resume":
-            updated = await service.resume_task(task_id)
-        elif action == "stop":
-            updated = await service.stop_task(task_id)
-        elif action == "notify_on":
-            updated = await service.toggle_notifications(task_id, True)
-        elif action == "notify_off":
-            updated = await service.toggle_notifications(task_id, False)
-        else:
+        try:
+            if action == "pause":
+                updated = await service.pause_task(task_id)
+            elif action == "resume":
+                updated = await service.resume_task(task_id)
+            elif action == "stop":
+                updated = await service.stop_task(task_id)
+            elif action == "notify_on":
+                updated = await service.toggle_notifications(task_id, True)
+            elif action == "notify_off":
+                updated = await service.toggle_notifications(task_id, False)
+            else:
+                return None
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Не удалось обновить состояние автозадачи",
+                extra={"task_id": task_id, "user_id": user_id, "action": action, "error": str(exc)},
+            )
             return None
         return updated or await service.get_task(task_id)
 
@@ -542,6 +655,16 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return
         await _render_mode_prompt(event, sessions)
 
+    @client.on(events.NewMessage(pattern=STOP_AUTO_PATTERN))
+    async def handle_stop_autobroadcast(event: NewMessage.Event) -> None:
+        if not event.is_private:
+            return
+        tasks = await service.list_tasks_for_user(event.sender_id)
+        if not tasks:
+            await event.respond("Активных автозадач не найдено.", buttons=build_main_menu_keyboard())
+            return
+        await event.respond(STOP_MENU_PROMPT, buttons=_stop_menu_buttons())
+
     @client.on(events.CallbackQuery(pattern=rf"^{MODE_CALLBACK}:".encode("utf-8")))
     async def handle_mode_selection(event: CallbackQuery.Event) -> None:
         state = state_manager.get(event.sender_id)
@@ -662,7 +785,34 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         state = state_manager.clear(event.sender_id)
         await event.answer("Отменено.")
         with contextlib.suppress(Exception):
-            await event.edit("Автозадача отменена.", buttons=build_main_menu_keyboard())
+            await event.edit("Автозадача отменена.")
+        await event.respond("Возвращаюсь в главное меню.", buttons=build_main_menu_keyboard())
+
+    @client.on(events.CallbackQuery(pattern=rf"^{STOP_MENU_CALLBACK}:".encode("utf-8")))
+    async def handle_stop_menu_callback(event: CallbackQuery.Event) -> None:
+        payload = event.data.decode("utf-8", errors="ignore")
+        parts = payload.split(":", maxsplit=2)
+        option = parts[1] if len(parts) > 1 else ""
+        if option == "cancel":
+            await event.answer("Отменено.")
+            with contextlib.suppress(Exception):
+                await event.edit("Действие отменено.")
+            await event.respond("Возвращаюсь в главное меню.", buttons=build_main_menu_keyboard())
+            return
+        if option == "back":
+            await event.answer("Назад.")
+            with contextlib.suppress(Exception):
+                await event.edit(STOP_MENU_PROMPT, buttons=_stop_menu_buttons())
+            return
+        if option == STOP_SINGLE_OPTION:
+            await event.answer("Выбираю задачи одного аккаунта…")
+            await _render_stop_task_selector(event, AccountMode.SINGLE)
+            return
+        if option == STOP_ALL_OPTION:
+            await event.answer("Выбираю общие задачи…")
+            await _render_stop_task_selector(event, AccountMode.ALL)
+            return
+        await event.answer("Неизвестный выбор.", alert=True)
 
     @client.on(events.CallbackQuery(pattern=rf"^{TASK_ACTION_CALLBACK}:".encode("utf-8")))
     async def handle_task_action_callback(event: CallbackQuery.Event) -> None:
@@ -675,7 +825,8 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if action == "cancel":
             await event.answer("Отменено.")
             with contextlib.suppress(Exception):
-                await event.edit("Действие отменено.", buttons=build_main_menu_keyboard())
+                await event.edit("Действие отменено.")
+            await event.respond("Возвращаюсь в главное меню.", buttons=build_main_menu_keyboard())
             return
         meta = TASK_ACTIONS.get(action)
         if meta is None:
@@ -689,13 +840,15 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if task is None:
             await event.answer("Задача не найдена или недоступна.", alert=True)
             with contextlib.suppress(Exception):
-                await event.edit("Задача не найдена или недоступна.", buttons=build_main_menu_keyboard())
+                await event.edit("Задача не найдена или недоступна.")
+            await event.respond("Не удалось найти выбранную автозадачу. Попробуйте обновить список через /auto_status.", buttons=build_main_menu_keyboard())
             return
         await event.answer("Готово.")
         labels = await _build_account_label_map(event.sender_id, [task])
         summary = _format_task_summary(task, labels)
         with contextlib.suppress(Exception):
-            await event.edit(f"{meta.success_text}\n\n{summary}", buttons=build_main_menu_keyboard())
+            await event.edit("Готово ✅")
+        await event.respond(f"{meta.success_text}\n\n{summary}", buttons=build_main_menu_keyboard())
 
     async def _handle_task_command(event: NewMessage.Event, action: str) -> None:
         if not event.is_private:
@@ -724,10 +877,8 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             await event.respond("Активные автозадачи не найдены.", buttons=build_main_menu_keyboard())
             return
         labels = await _build_account_label_map(event.sender_id, tasks)
-        lines = ["Текущие автозадачи:"]
-        for idx, task in enumerate(tasks, start=1):
-            lines.append(f"{idx}.\n{_format_task_summary(task, labels)}")
-        await event.respond("\n\n".join(lines), buttons=build_main_menu_keyboard())
+        blocks = [f"{idx}.\n{_format_task_summary(task, labels)}" for idx, task in enumerate(tasks, start=1)]
+        await event.respond("\n\n".join(blocks), buttons=build_main_menu_keyboard())
 
     @client.on(events.NewMessage(pattern=AUTO_PAUSE_PATTERN))
     async def handle_pause(event: NewMessage.Event) -> None:

@@ -12,6 +12,7 @@ UPLOAD_GROUPS_LABEL = "Загрузить группы из файла"
 VIEW_GROUPS_LABEL = "Просмотреть группы для рассылки"
 BROADCAST_LABEL = "Запустить рассылку"
 AUTO_TASK_LABEL = "Автозадача"
+STOP_AUTO_LABEL = "Остановить авторассылку"
 
 
 def build_main_menu_keyboard() -> list[list[Button]]:
@@ -34,6 +35,7 @@ def build_main_menu_keyboard() -> list[list[Button]]:
         ],
         [
             Button.text(AUTO_TASK_LABEL, resize=True),
+            Button.text(STOP_AUTO_LABEL, resize=True),
             Button.text("/auto_status", resize=True),
         ],
     ]

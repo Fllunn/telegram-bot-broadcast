@@ -29,7 +29,7 @@ def setup_start_command(client, context: BotContext) -> None:
                 "Привет! Я помогу подключить и управлять несколькими аккаунтами."
                 "\nИспользуйте кнопки ниже или команды /help, /login_phone, /login_qr, /accounts, /add_text, /add_image, /view_broadcast, /upload_groups, /broadcast."
                 "\nКоманда /view_groups покажет сохранённые списки групп."
-                "\nДля автозадач используйте кнопку 'Автозадача' или команды /auto_status, /auto_pause <task_id>, /auto_resume <task_id>, /auto_stop <task_id>."
+                "\nДля автозадач используйте кнопки 'Автозадача', 'Остановить авторассылку' или команду /auto_status."
             ),
             buttons=build_main_menu_keyboard(),
         )
