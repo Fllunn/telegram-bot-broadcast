@@ -14,7 +14,7 @@ from telethon.events import CallbackQuery, NewMessage
 from src.bot.context import BotContext
 from src.bot.keyboards import STOP_AUTO_LABEL, build_main_menu_keyboard
 from src.models.auto_broadcast import AccountMode, AutoBroadcastTask, GroupTarget, TaskStatus
-from src.services.auto_broadcast.engine import InvalidIntervalError
+from src.services.auto_broadcast.engine import AccountInUseError, InvalidIntervalError
 from src.services.auto_broadcast.payloads import extract_image_metadata
 from src.services.auto_broadcast.state_manager import (
     AutoTaskSetupState,
@@ -40,13 +40,14 @@ NOTIFY_CALLBACK = "auto_notify"
 CANCEL_CALLBACK = "auto_cancel"
 TASK_ACTION_CALLBACK = "auto_task_action"
 STOP_MENU_CALLBACK = "auto_stop_menu"
+STOP_SELECT_CALLBACK = "auto_stop_select"
 
 STOP_SINGLE_OPTION = "single"
 STOP_ALL_OPTION = "all"
 
-STOP_MENU_PROMPT = "Выберите тип автозадач для остановки:"
-STOP_SINGLE_LABEL = "Остановить автозадачу одного аккаунта"
-STOP_ALL_LABEL = "Остановить автозадачу всех аккаунтов"
+STOP_MENU_PROMPT = "Выберите, что остановить:\n• Только для этого аккаунта\n• Все автозадачи"
+STOP_SINGLE_LABEL = "Только для этого аккаунта"
+STOP_ALL_LABEL = "Все автозадачи"
 
 
 @dataclass(frozen=True)
@@ -66,11 +67,6 @@ TASK_ACTIONS: Dict[str, TaskActionMeta] = {
         prompt="Выберите задачу, которую нужно возобновить:",
         empty_text="Нет задач, доступных для возобновления.",
         success_text="Задача возобновлена.",
-    ),
-    "stop": TaskActionMeta(
-        prompt="Выберите задачу, которую нужно остановить:",
-        empty_text="Нет задач, доступных для остановки.",
-        success_text="Задача остановлена.",
     ),
     "notify_on": TaskActionMeta(
         prompt="Выберите задачу, для которой включить уведомления:",
@@ -323,6 +319,26 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             candidates.append(task.current_account_id)
         return _deduplicate_preserve_order(candidates)
 
+    def _build_stop_result_message(stopped: int, requested: int) -> Optional[str]:
+        if stopped <= 0:
+            return None
+        if requested <= 1:
+            return "Авторассылка остановлена."
+        if stopped == requested:
+            return "Авторассылка для всех аккаунтов остановлена."
+        return f"Авторассылка остановлена для {stopped} из {requested} задач."
+
+    async def _finalize_stop_callback(
+        event: CallbackQuery.Event,
+        *,
+        message: str,
+        edit_text: Optional[str] = "Готово.",
+    ) -> None:
+        if edit_text is not None:
+            with contextlib.suppress(Exception):
+                await event.edit(edit_text, buttons=None)
+        await event.respond(message, buttons=build_main_menu_keyboard())
+
     async def _build_account_label_map(
         user_id: int,
         tasks: Optional[List[AutoBroadcastTask]] = None,
@@ -446,55 +462,11 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         next_run = _humanize_next_run(task.next_run_ts, with_exact=False)
         return f"{icon} {primary} • {next_run}"
 
-    def _format_stop_menu_line(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
-        accounts_text = _format_account_list(task, labels)
-        interval_text = service.humanize_interval(task.user_interval_seconds)
-        return f"{accounts_text} — {interval_text}"
-
-    def _build_stop_option_label(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
-        accounts_text = _primary_account_label(task, labels)
-        interval_text = service.humanize_interval(task.user_interval_seconds)
-        return f"{accounts_text} • {interval_text}"
-
-    async def _render_stop_task_selector(event: CallbackQuery.Event, mode: AccountMode) -> None:
-        meta = TASK_ACTIONS["stop"]
-        tasks = await service.list_tasks_for_user(event.sender_id)
-        applicable = [task for task in tasks if _is_task_applicable(task, "stop") and task.account_mode == mode]
-        if not applicable:
-            buttons = [
-                [Button.inline("« Назад", f"{STOP_MENU_CALLBACK}:back".encode("utf-8"))],
-                [Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))],
-            ]
-            with contextlib.suppress(Exception):
-                await event.edit(meta.empty_text, buttons=buttons)
-            return
-
-        labels = await _build_account_label_map(event.sender_id, applicable)
-        header = "Выберите автозадачу для остановки:" if mode == AccountMode.SINGLE else "Выберите общую автозадачу для остановки:"
-        lines = [header]
-        for idx, task in enumerate(applicable, start=1):
-            lines.append(f"{idx}. {_format_stop_menu_line(task, labels)}")
-        buttons = [
-            [
-                Button.inline(
-                    _build_stop_option_label(task, labels),
-                    f"{TASK_ACTION_CALLBACK}:stop:{task.task_id}".encode("utf-8"),
-                )
-            ]
-            for task in applicable
-        ]
-        buttons.append([Button.inline("« Назад", f"{STOP_MENU_CALLBACK}:back".encode("utf-8"))])
-        buttons.append([Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))])
-        with contextlib.suppress(Exception):
-            await event.edit("\n".join(lines), buttons=buttons)
-
     def _is_task_applicable(task: AutoBroadcastTask, action: str) -> bool:
         if action == "pause":
             return task.status == TaskStatus.RUNNING and task.enabled
         if action == "resume":
             return task.status in {TaskStatus.PAUSED, TaskStatus.ERROR}
-        if action == "stop":
-            return task.status != TaskStatus.STOPPED
         if action == "notify_on":
             return not task.notify_each_cycle
         if action == "notify_off":
@@ -510,8 +482,6 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 updated = await service.pause_task(task_id)
             elif action == "resume":
                 updated = await service.resume_task(task_id)
-            elif action == "stop":
-                updated = await service.stop_task(task_id)
             elif action == "notify_on":
                 updated = await service.toggle_notifications(task_id, True)
             elif action == "notify_off":
@@ -532,7 +502,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return
         tasks = await service.list_tasks_for_user(event.sender_id)
         if not tasks:
-            await event.respond("Активных автозадач не найдено.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
             return
         applicable = [task for task in tasks if _is_task_applicable(task, action)]
         if not applicable:
@@ -582,6 +552,9 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 "Интервал слишком маленький. Минимально допустимое время — {0}.".format(minimum),
                 buttons=build_main_menu_keyboard(),
             )
+            return
+        except AccountInUseError as exc:
+            await event.respond(str(exc), buttons=build_main_menu_keyboard())
             return
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception("Не удалось создать автозадачу", exc_info=exc, extra={"user_id": event.sender_id})
@@ -635,12 +608,6 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         message = await event.edit(text, buttons=buttons)
         state_manager.update(event.sender_id, last_message_id=message.id)
 
-    def _extract_task_id(message: str) -> Optional[str]:
-        parts = message.strip().split()
-        if len(parts) < 2:
-            return None
-        return parts[1].strip()
-
     @client.on(events.NewMessage(pattern=AUTO_SCHEDULE_PATTERN))
     async def handle_auto_schedule(event: NewMessage.Event) -> None:
         if not event.is_private:
@@ -659,9 +626,20 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     async def handle_stop_autobroadcast(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
-        tasks = await service.list_tasks_for_user(event.sender_id)
+        tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
         if not tasks:
-            await event.respond("Активных автозадач не найдено.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+            return
+        if len(tasks) == 1:
+            stopped, requested = await service.stop_tasks(
+                user_id=event.sender_id,
+                task_ids=[tasks[0].task_id],
+            )
+            if stopped <= 0:
+                await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+                return
+            message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
+            await event.respond(message, buttons=build_main_menu_keyboard())
             return
         await event.respond(STOP_MENU_PROMPT, buttons=_stop_menu_buttons())
 
@@ -799,20 +777,94 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 await event.edit("Действие отменено.")
             await event.respond("Возвращаюсь в главное меню.", buttons=build_main_menu_keyboard())
             return
-        if option == "back":
-            await event.answer("Назад.")
-            with contextlib.suppress(Exception):
-                await event.edit(STOP_MENU_PROMPT, buttons=_stop_menu_buttons())
-            return
         if option == STOP_SINGLE_OPTION:
-            await event.answer("Выбираю задачи одного аккаунта…")
-            await _render_stop_task_selector(event, AccountMode.SINGLE)
+            tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
+            if not tasks:
+                await event.answer("Нет активных автозадач.", alert=True)
+                await _finalize_stop_callback(
+                    event,
+                    message="Нет активных автозадач.",
+                    edit_text="Нет активных автозадач.",
+                )
+                return
+            if len(tasks) == 1:
+                await event.answer("Останавливаю…")
+                stopped, requested = await service.stop_tasks(
+                    user_id=event.sender_id,
+                    task_ids=[tasks[0].task_id],
+                )
+                if stopped <= 0:
+                    await _finalize_stop_callback(
+                        event,
+                        message="Нет активных автозадач.",
+                        edit_text="Нет активных автозадач.",
+                    )
+                    return
+                message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
+                await _finalize_stop_callback(event, message=message)
+                return
+            labels = await _build_account_label_map(event.sender_id, tasks)
+            lines = ["Выберите аккаунт для остановки:"]
+            buttons = [
+                [
+                    Button.inline(
+                        _format_account_list(task, labels),
+                        f"{STOP_SELECT_CALLBACK}:{task.task_id}".encode("utf-8"),
+                    )
+                ]
+                for task in tasks
+            ]
+            buttons.append([Button.inline("Отмена", f"{STOP_MENU_CALLBACK}:cancel".encode("utf-8"))])
+            with contextlib.suppress(Exception):
+                await event.edit("\n".join(lines), buttons=buttons)
             return
         if option == STOP_ALL_OPTION:
-            await event.answer("Выбираю общие задачи…")
-            await _render_stop_task_selector(event, AccountMode.ALL)
+            tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
+            if not tasks:
+                await event.answer("Нет активных автозадач.", alert=True)
+                await _finalize_stop_callback(
+                    event,
+                    message="Нет активных автозадач.",
+                    edit_text="Нет активных автозадач.",
+                )
+                return
+            await event.answer("Останавливаю…")
+            stopped, requested = await service.stop_tasks(
+                user_id=event.sender_id,
+                task_ids=[task.task_id for task in tasks],
+            )
+            if stopped <= 0:
+                await _finalize_stop_callback(
+                    event,
+                    message="Нет активных автозадач.",
+                    edit_text="Нет активных автозадач.",
+                )
+                return
+            message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
+            await _finalize_stop_callback(event, message=message)
             return
         await event.answer("Неизвестный выбор.", alert=True)
+
+    @client.on(events.CallbackQuery(pattern=rf"^{STOP_SELECT_CALLBACK}:".encode("utf-8")))
+    async def handle_stop_select_callback(event: CallbackQuery.Event) -> None:
+        payload = event.data.decode("utf-8", errors="ignore")
+        parts = payload.split(":", maxsplit=1)
+        task_id = parts[1] if len(parts) > 1 else ""
+        if not task_id:
+            await event.answer("Некорректный выбор.", alert=True)
+            return
+        stopped, requested = await service.stop_tasks(user_id=event.sender_id, task_ids=[task_id])
+        if stopped <= 0:
+            await event.answer("Задача не найдена или недоступна.", alert=True)
+            await _finalize_stop_callback(
+                event,
+                message="Задача не найдена или недоступна.",
+                edit_text="Задача не найдена или недоступна.",
+            )
+            return
+        message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
+        await event.answer("Готово.")
+        await _finalize_stop_callback(event, message=message)
 
     @client.on(events.CallbackQuery(pattern=rf"^{TASK_ACTION_CALLBACK}:".encode("utf-8")))
     async def handle_task_action_callback(event: CallbackQuery.Event) -> None:
@@ -853,18 +905,11 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     async def _handle_task_command(event: NewMessage.Event, action: str) -> None:
         if not event.is_private:
             return
+        if action == "stop":
+            await handle_stop_autobroadcast(event)
+            return
         meta = TASK_ACTIONS.get(action)
         if meta is None:
-            return
-        task_id = _extract_task_id(event.raw_text or "")
-        if task_id:
-            task = await _execute_task_action(event.sender_id, action, task_id)
-            if task is None:
-                await event.respond("Задача не найдена или недоступна.", buttons=build_main_menu_keyboard())
-                return
-            labels = await _build_account_label_map(event.sender_id, [task])
-            summary = _format_task_summary(task, labels)
-            await event.respond(f"{meta.success_text}\n\n{summary}", buttons=build_main_menu_keyboard())
             return
         await _show_task_action_menu(event, action)
 
@@ -872,13 +917,14 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     async def handle_status(event: NewMessage.Event) -> None:
         if not event.is_private:
             return
-        tasks = await service.list_tasks_for_user(event.sender_id)
+        tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
         if not tasks:
-            await event.respond("Активные автозадачи не найдены.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
             return
         labels = await _build_account_label_map(event.sender_id, tasks)
         blocks = [f"{idx}.\n{_format_task_summary(task, labels)}" for idx, task in enumerate(tasks, start=1)]
-        await event.respond("\n\n".join(blocks), buttons=build_main_menu_keyboard())
+        body = "\n\n".join(blocks)
+        await event.respond(f"Автозадачи:\n\n{body}", buttons=build_main_menu_keyboard())
 
     @client.on(events.NewMessage(pattern=AUTO_PAUSE_PATTERN))
     async def handle_pause(event: NewMessage.Event) -> None:

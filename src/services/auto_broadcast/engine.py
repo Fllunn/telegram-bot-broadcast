@@ -4,7 +4,7 @@ import logging
 import secrets
 from datetime import datetime
 import math
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 from telethon import TelegramClient
 
@@ -28,6 +28,10 @@ class InvalidIntervalError(ValueError):
     def __init__(self, minimum_seconds: float) -> None:
         super().__init__("Interval is below required minimum")
         self.minimum_seconds = minimum_seconds
+
+
+class AccountInUseError(RuntimeError):
+    """Raised when attempting to create an auto task for an occupied account."""
 
 
 class AutoBroadcastService:
@@ -73,13 +77,21 @@ class AutoBroadcastService:
         self.state_manager = AutoTaskStateManager()
 
     async def start(self) -> None:
+        await self._self_heal_all_tasks()
         await self._supervisor.start()
 
     async def stop(self) -> None:
         await self._supervisor.stop()
 
-    async def list_tasks_for_user(self, user_id: int) -> List[AutoBroadcastTask]:
-        return await self._tasks.list_for_user(user_id)
+    async def list_tasks_for_user(self, user_id: int, *, active_only: bool = False) -> List[AutoBroadcastTask]:
+        tasks = await self._tasks.list_for_user(user_id)
+        cleaned = await self._clean_user_tasks(user_id, tasks)
+        if active_only:
+            cleaned = [task for task in cleaned if self._is_task_active(task)]
+        return cleaned
+
+    async def list_active_tasks(self, user_id: int) -> List[AutoBroadcastTask]:
+        return [task for task in await self.list_tasks_for_user(user_id, active_only=True) if self._is_task_active(task)]
 
     async def get_task(self, task_id: str) -> Optional[AutoBroadcastTask]:
         return await self._tasks.get_by_task_id(task_id)
@@ -99,11 +111,50 @@ class AutoBroadcastService:
         self._supervisor.request_refresh()
         return await self._tasks.get_by_task_id(task_id)
 
-    async def stop_task(self, task_id: str) -> Optional[AutoBroadcastTask]:
-        task = await self._tasks.update_status(task_id, status=TaskStatus.STOPPED, enabled=False)
-        if task:
+    async def remove_task(self, *, task_id: str, user_id: int) -> bool:
+        task = await self._tasks.get_by_task_id(task_id)
+        if task is None or task.user_id != user_id:
+            return False
+        await self._supervisor.remove_task(task_id)
+        deleted = await self._tasks.delete_task(task_id)
+        if deleted:
             self._supervisor.request_refresh()
-        return task
+        return deleted
+
+    async def remove_tasks(self, *, user_id: int, task_ids: Optional[Sequence[str]] = None) -> int:
+        stopped, _ = await self.stop_tasks(user_id=user_id, task_ids=task_ids)
+        return stopped
+
+    async def stop_tasks(
+        self,
+        *,
+        user_id: int,
+        task_ids: Optional[Sequence[str]] = None,
+    ) -> tuple[int, int]:
+        """
+        Stop and remove auto broadcast tasks for the user.
+
+        Returns tuple (stopped_count, total_requested).
+        """
+        tasks = await self._tasks.list_for_user(user_id)
+        tasks = await self._clean_user_tasks(user_id, tasks)
+        if task_ids is not None:
+            id_set = {task_id for task_id in task_ids if task_id}
+            filtered = [task for task in tasks if task.task_id in id_set]
+        else:
+            filtered = list(tasks)
+        total_requested = len(filtered)
+        if not filtered:
+            return 0, total_requested
+        stopped = 0
+        for task in filtered:
+            await self._supervisor.remove_task(task.task_id)
+            deleted = await self._tasks.delete_task(task.task_id)
+            if deleted:
+                stopped += 1
+        if stopped:
+            self._supervisor.request_refresh()
+        return stopped, total_requested
 
     async def toggle_notifications(self, task_id: str, enabled: bool) -> Optional[AutoBroadcastTask]:
         return await self._tasks.update_notify_flag(task_id, enabled)
@@ -124,13 +175,19 @@ class AutoBroadcastService:
         if not sessions:
             raise ValueError("Нет доступных аккаунтов для создания автозадачи")
 
+        existing_tasks = await self._tasks.list_for_user(user_id)
+        await self._clean_user_tasks(user_id, existing_tasks)
+        await self._ensure_accounts_available(user_id, sessions)
+
         if not math.isfinite(user_interval_seconds) or user_interval_seconds <= 0:
             raise ValueError("Укажите корректный интервал между циклами")
 
         groups_by_account = self._extract_groups(sessions)
         total_groups = sum(len(groups) for groups in groups_by_account.values())
         if total_groups == 0:
-            raise ValueError("Для выбранных аккаунтов не настроены группы для рассылки")
+            raise ValueError(
+                "Невозможно создать автозадачу: нет доступных групп. Добавьте хотя бы одну группу и попробуйте снова."
+            )
 
         materials_presence: Dict[str, bool] = {}
         for session in sessions:
@@ -429,6 +486,118 @@ class AutoBroadcastService:
             raise ValueError("Указанные аккаунты недоступны или отключены")
         return sessions
 
+    async def _ensure_accounts_available(self, user_id: int, sessions: Sequence[TelethonSession]) -> None:
+        account_ids = [session.session_id for session in sessions]
+        existing = await self._tasks.find_active_for_accounts(account_ids, user_id=user_id)
+        if not existing:
+            return
+        occupied: Set[str] = set()
+        for task in existing:
+            occupied.update(self._task_account_ids(task) & set(account_ids))
+        for session in sessions:
+            if session.session_id in occupied:
+                label = self._format_account_label(session)
+                raise AccountInUseError(
+                    "На аккаунт {label} уже запущена авторассылка.\nВы можете остановить её через кнопку \"Остановить авторассылку\".".format(
+                        label=label
+                    )
+                )
+
+    async def _clean_user_tasks(self, user_id: int, tasks: List[AutoBroadcastTask]) -> List[AutoBroadcastTask]:
+        if not tasks:
+            return []
+        active_sessions_iter = await self._session_manager.get_active_sessions(user_id)
+        active_sessions = {session.session_id: session for session in active_sessions_iter}
+        tasks_sorted = sorted(
+            tasks,
+            key=lambda t: (
+                self._is_task_active(t),
+                t.created_at or t.updated_at or datetime.utcnow(),
+            ),
+            reverse=True,
+        )
+        accounts_seen: Set[str] = set()
+        keep: List[AutoBroadcastTask] = []
+        to_remove: List[AutoBroadcastTask] = []
+        for task in tasks_sorted:
+            account_ids = self._task_account_ids(task)
+            if not account_ids:
+                to_remove.append(task)
+                continue
+            if any(account_id not in active_sessions for account_id in account_ids):
+                to_remove.append(task)
+                continue
+            if any(account_id in accounts_seen for account_id in account_ids):
+                to_remove.append(task)
+                continue
+            accounts_seen.update(account_ids)
+            keep.append(task)
+        if to_remove:
+            for task in to_remove:
+                await self._supervisor.remove_task(task.task_id)
+            await self._tasks.delete_tasks_for_user(user_id, [task.task_id for task in to_remove])
+            for task in to_remove:
+                logger.warning(
+                    "Auto-task removed during cleanup", extra={"task_id": task.task_id, "user_id": user_id}
+                )
+            self._supervisor.request_refresh()
+        ordered_keep = sorted(keep, key=lambda t: t.created_at or t.updated_at or datetime.utcnow())
+        return ordered_keep
+
+    async def _self_heal_all_tasks(self) -> None:
+        active_tasks = await self._tasks.list_active_tasks()
+        if not active_tasks:
+            return
+        per_user: Dict[int, List[AutoBroadcastTask]] = {}
+        for task in active_tasks:
+            per_user.setdefault(task.user_id, []).append(task)
+        for user_id in per_user:
+            all_tasks = await self._tasks.list_for_user(user_id)
+            await self._clean_user_tasks(user_id, all_tasks)
+
+    @staticmethod
+    def _task_account_ids(task: AutoBroadcastTask) -> Set[str]:
+        ids: List[str] = []
+        if task.account_id:
+            ids.append(task.account_id)
+        ids.extend(task.account_ids or [])
+        if task.current_account_id:
+            ids.append(task.current_account_id)
+        return {account_id for account_id in ids if account_id}
+
+    @staticmethod
+    def _is_task_active(task: AutoBroadcastTask) -> bool:
+        return bool(task.enabled and task.status == TaskStatus.RUNNING)
+
+    @staticmethod
+    def _format_account_label(session: TelethonSession) -> str:
+        metadata = session.metadata or {}
+        username = metadata.get("username") if isinstance(metadata, Mapping) else None
+        label = AutoBroadcastService._normalize_username(username)
+        if label:
+            return f"@{label}"
+        phone = session.phone or (metadata.get("phone") if isinstance(metadata, Mapping) else None)
+        normalized_phone = AutoBroadcastService._normalize_phone(phone)
+        if normalized_phone:
+            return normalized_phone
+        return "аккаунт"
+
+    @staticmethod
+    def _normalize_username(username: Optional[str]) -> Optional[str]:
+        if not username:
+            return None
+        value = str(username).strip().lstrip("@")
+        return value or None
+
+    @staticmethod
+    def _normalize_phone(phone: Optional[str]) -> Optional[str]:
+        if not phone:
+            return None
+        digits = "".join(ch for ch in str(phone).strip() if ch not in {" ", "-", "(", ")"})
+        if not digits:
+            return None
+        formatted = digits if digits.startswith("+") else f"+{digits.lstrip('+')}"
+        return formatted if len(formatted) >= 4 else None
     def _extract_groups(self, sessions: Sequence[TelethonSession]) -> Dict[str, List[GroupTarget]]:
         result: Dict[str, List[GroupTarget]] = {}
         for session in sessions:

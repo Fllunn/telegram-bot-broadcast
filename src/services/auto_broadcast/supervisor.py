@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from telethon import TelegramClient
 
@@ -115,7 +115,19 @@ class AutoBroadcastSupervisor:
                 continue
 
     async def _sync_active_tasks(self) -> None:
-        active_tasks = await self._tasks.list_active_tasks()
+        raw_tasks = await self._tasks.list_active_tasks()
+        active_tasks: List[AutoBroadcastTask] = []
+        for task in raw_tasks:
+            if await self._should_remove_due_to_inactive_accounts(task):
+                await self._stop_runner(task.task_id)
+                removed = await self._tasks.delete_task(task.task_id)
+                if removed:
+                    logger.warning(
+                        "Removed auto broadcast task due to inactive account",
+                        extra={"task_id": task.task_id, "user_id": task.user_id},
+                    )
+                continue
+            active_tasks.append(task)
         active_ids = {task.task_id for task in active_tasks}
 
         for task in active_tasks:
@@ -128,6 +140,30 @@ class AutoBroadcastSupervisor:
         for task_id in list(self._handles.keys()):
             if task_id not in active_ids:
                 await self._stop_runner(task_id)
+
+    async def _should_remove_due_to_inactive_accounts(self, task: AutoBroadcastTask) -> bool:
+        account_ids = self._collect_account_ids(task)
+        if not account_ids:
+            return True
+        for account_id in account_ids:
+            session = await self._sessions.get_by_session_id(account_id)
+            if session is None or not session.is_active:
+                return True
+        return False
+
+    @staticmethod
+    def _collect_account_ids(task: AutoBroadcastTask) -> List[str]:
+        ids: List[str] = []
+        if task.account_id:
+            ids.append(task.account_id)
+        ids.extend(task.account_ids or [])
+        if task.current_account_id:
+            ids.append(task.current_account_id)
+        return [account_id for account_id in ids if account_id]
+
+    async def remove_task(self, task_id: str) -> None:
+        await self._stop_runner(task_id)
+        self._wake_event.set()
 
     async def _launch_runner(self, task: AutoBroadcastTask) -> None:
         runner = AutoBroadcastRunner(

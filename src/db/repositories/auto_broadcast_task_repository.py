@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo import ReturnDocument
@@ -89,6 +89,35 @@ class AutoBroadcastTaskRepository:
                 "status": TaskStatus.RUNNING.value,
             }
         )
+        tasks: List[AutoBroadcastTask] = []
+        async for document in cursor:
+            tasks.append(AutoBroadcastTask.model_validate(self._stringify_object_id(document)))
+        return tasks
+
+    async def find_active_for_accounts(
+        self,
+        account_ids: Sequence[str],
+        *,
+        user_id: Optional[int] = None,
+    ) -> List[AutoBroadcastTask]:
+        ids = [account_id for account_id in account_ids if account_id]
+        if not ids:
+            return []
+        query: dict = {
+            "$and": [
+                {"enabled": True},
+                {"status": {"$in": [TaskStatus.RUNNING.value, TaskStatus.PAUSED.value]}},
+                {
+                    "$or": [
+                        {"account_id": {"$in": ids}},
+                        {"account_ids": {"$in": ids}},
+                    ]
+                },
+            ]
+        }
+        if user_id is not None:
+            query["$and"].append({"user_id": user_id})
+        cursor = self._collection.find(query)
         tasks: List[AutoBroadcastTask] = []
         async for document in cursor:
             tasks.append(AutoBroadcastTask.model_validate(self._stringify_object_id(document)))
@@ -280,3 +309,17 @@ class AutoBroadcastTaskRepository:
                 }
             },
         )
+
+    async def delete_task(self, task_id: str) -> bool:
+        result = await self._collection.delete_one({"task_id": task_id})
+        return bool(result.deleted_count)
+
+    async def delete_tasks_for_user(self, user_id: int, task_ids: Optional[Sequence[str]] = None) -> int:
+        query: dict[str, object] = {"user_id": user_id}
+        if task_ids is not None:
+            ids = [task_id for task_id in task_ids if task_id]
+            if not ids:
+                return 0
+            query["task_id"] = {"$in": ids}
+        result = await self._collection.delete_many(query)
+        return result.deleted_count or 0
