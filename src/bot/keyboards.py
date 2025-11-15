@@ -11,7 +11,7 @@ VIEW_BROADCAST_LABEL = "Просмотреть текст и картинку д
 UPLOAD_GROUPS_LABEL = "Загрузить группы из файла"
 VIEW_GROUPS_LABEL = "Просмотреть группы для рассылки"
 BROADCAST_LABEL = "Запустить рассылку"
-AUTO_TASK_LABEL = "Автозадача"
+AUTO_TASK_LABEL = "Авторассылка"
 STOP_AUTO_LABEL = "Остановить авторассылку"
 
 

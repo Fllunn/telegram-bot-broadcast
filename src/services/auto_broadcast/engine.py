@@ -17,6 +17,7 @@ from src.services.auto_broadcast.state_manager import AutoTaskStateManager
 from src.services.auto_broadcast.supervisor import AutoBroadcastSupervisor
 from src.services.auto_broadcast.payloads import extract_image_metadata
 from src.services.telethon_manager import TelethonSessionManager
+from src.services.account_status import AccountStatusService
 
 
 logger = logging.getLogger(__name__)
@@ -51,11 +52,13 @@ class AutoBroadcastService:
         max_delay_per_message: int,
         batch_pause_max_seconds: float = 15.0,
         interval_safety_margin_seconds: float = 5.0,
+        account_status_service: AccountStatusService,
     ) -> None:
         self._tasks = task_repository
         self._accounts = account_repository
         self._sessions = session_repository
         self._session_manager = session_manager
+        self._account_status_service = account_status_service
         self._bot_client = bot_client
         self._max_delay = max_delay_per_message
         self._batch_pause_max = max(0.0, float(batch_pause_max_seconds))
@@ -73,6 +76,7 @@ class AutoBroadcastService:
             max_delay_per_message=max_delay_per_message,
             batch_pause_max_seconds=self._batch_pause_max,
             interval_safety_margin_seconds=self._interval_safety_margin,
+            account_status_service=account_status_service,
         )
         self.state_manager = AutoTaskStateManager()
 
@@ -254,21 +258,28 @@ class AutoBroadcastService:
     async def load_active_sessions(self, user_id: int, *, ensure_fresh_metadata: bool = False) -> List[TelethonSession]:
         sessions = await self._session_manager.get_active_sessions(
             user_id,
-            verify_live=True,
+            verify_live=False,
+        )
+        if not sessions:
+            return []
+
+        statuses = await self._account_status_service.refresh_sessions(
+            sessions,
+            verify_dialog_access=True,
+            use_cache=False,
         )
         validated: List[TelethonSession] = []
         for session in sessions:
-            has_dialogs = await self._session_manager.ensure_dialog_access(session)
-            if not has_dialogs:
+            status = statuses.get(session.session_id)
+            if status is None or not status.active:
                 await self._session_manager.deactivate_session(session.session_id)
                 await self.mark_account_inactive(
                     session.session_id,
                     owner_id=session.owner_id,
-                    reason="dialog_fetch_failed",
+                    reason=(status.detail if status else "dialog_fetch_failed"),
                     metadata=session.metadata,
                 )
                 continue
-            session.is_active = True
             await self.mark_account_active(
                 session.session_id,
                 owner_id=session.owner_id,
@@ -290,18 +301,21 @@ class AutoBroadcastService:
             if latest is None:
                 refreshed.append(session)
                 continue
-            has_dialogs = await self._session_manager.ensure_dialog_access(latest)
-            if not has_dialogs:
+            status = await self._account_status_service.refresh_session(
+                latest,
+                verify_dialog_access=True,
+                use_cache=False,
+            )
+            if not status.active:
                 await self._session_manager.deactivate_session(latest.session_id)
                 await self.mark_account_inactive(
                     latest.session_id,
                     owner_id=latest.owner_id,
-                    reason="dialog_fetch_failed",
+                    reason=status.detail or "dialog_fetch_failed",
                     metadata=latest.metadata,
                 )
                 continue
 
-            latest.is_active = True
             await self.mark_account_active(
                 latest.session_id,
                 owner_id=latest.owner_id,
@@ -562,28 +576,31 @@ class AutoBroadcastService:
         return target
 
     async def _load_sessions(self, user_id: int, session_ids: Sequence[str]) -> List[TelethonSession]:
-        sessions: List[TelethonSession] = []
+        fetched: List[TelethonSession] = []
         for session_id in session_ids:
             session = await self._sessions.get_by_session_id(session_id)
             if session is None or session.owner_id != user_id:
                 continue
-            is_live = await self._session_manager.verify_session_status(session)
-            if not is_live:
+            fetched.append(session)
+
+        if not fetched:
+            raise ValueError("Указанные аккаунты недоступны или отключены")
+
+        statuses = await self._account_status_service.refresh_sessions(
+            fetched,
+            verify_dialog_access=True,
+            use_cache=False,
+        )
+
+        sessions: List[TelethonSession] = []
+        for session in fetched:
+            status = statuses.get(session.session_id)
+            if status is None or not status.active:
                 await self._session_manager.deactivate_session(session.session_id)
                 await self.mark_account_inactive(
                     session.session_id,
                     owner_id=session.owner_id,
-                    reason="session_validation_failed",
-                    metadata=session.metadata,
-                )
-                continue
-            has_dialogs = await self._session_manager.ensure_dialog_access(session)
-            if not has_dialogs:
-                await self._session_manager.deactivate_session(session.session_id)
-                await self.mark_account_inactive(
-                    session.session_id,
-                    owner_id=session.owner_id,
-                    reason="dialog_fetch_failed",
+                    reason=(status.detail if status else "session_validation_failed"),
                     metadata=session.metadata,
                 )
                 continue
@@ -592,8 +609,8 @@ class AutoBroadcastService:
                 owner_id=session.owner_id,
                 metadata=session.metadata,
             )
-            session.is_active = True
             sessions.append(session)
+
         if not sessions:
             raise ValueError("Указанные аккаунты недоступны или отключены")
         return sessions
@@ -634,18 +651,36 @@ class AutoBroadcastService:
         accounts_seen: Set[str] = set()
         keep: List[AutoBroadcastTask] = []
         to_remove: List[AutoBroadcastTask] = []
+        pruned = False
         for task in tasks_sorted:
             account_ids = self._task_account_ids(task)
             if not account_ids:
                 to_remove.append(task)
                 continue
-            if any(account_id not in active_sessions for account_id in account_ids):
+
+            inactive_ids = [account_id for account_id in account_ids if account_id not in active_sessions]
+            if inactive_ids:
+                try:
+                    updated_task = await self._tasks.remove_accounts_from_task(task.task_id, inactive_ids)
+                except Exception:
+                    logger.exception(
+                        "Failed to prune inactive accounts from task",
+                        extra={"task_id": task.task_id, "user_id": user_id},
+                    )
+                else:
+                    if updated_task is not None:
+                        task = updated_task
+                        account_ids = self._task_account_ids(task)
+                        pruned = True
+
+            active_ids = [account_id for account_id in account_ids if account_id in active_sessions]
+            if not active_ids:
                 to_remove.append(task)
                 continue
-            if any(account_id in accounts_seen for account_id in account_ids):
+            if any(account_id in accounts_seen for account_id in active_ids):
                 to_remove.append(task)
                 continue
-            accounts_seen.update(account_ids)
+            accounts_seen.update(active_ids)
             keep.append(task)
         if to_remove:
             for task in to_remove:
@@ -655,6 +690,8 @@ class AutoBroadcastService:
                 logger.warning(
                     "Auto-task removed during cleanup", extra={"task_id": task.task_id, "user_id": user_id}
                 )
+            self._supervisor.request_refresh()
+        elif pruned:
             self._supervisor.request_refresh()
         ordered_keep = sorted(keep, key=lambda t: t.created_at or t.updated_at or datetime.utcnow())
         return ordered_keep

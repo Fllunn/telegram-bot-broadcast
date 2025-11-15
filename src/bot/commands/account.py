@@ -24,6 +24,7 @@ from src.bot.context import BotContext
 from src.bot.keyboards import ACCOUNTS_LABEL, LOGIN_PHONE_LABEL, LOGIN_QR_LABEL, build_main_menu_keyboard
 from src.models.session import SessionOwnerType, TelethonSession
 from src.services.auth_state import AuthSession, AuthStep
+from src.services.account_status import AccountStatusResult
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,23 @@ def _format_session(session: TelethonSession) -> str:
     title = _render_account_target(session)
     status = "активен" if session.is_active else "неактивен"
     return f"• {title} ({status})"
+
+
+def _format_session_status(
+    session: TelethonSession,
+    status: AccountStatusResult | None,
+    pending: bool = False,
+) -> str:
+    title = _render_account_target(session)
+    if pending and status is None:
+        return f"• {title} (проверяем...)"
+    if status is None:
+        fallback = "активен" if session.is_active else "неактивен"
+        return f"• {title} ({fallback})"
+    if status.active:
+        return f"• {title} (активен)"
+    reason = status.reason if status.reason else "требуется повторный вход"
+    return f"• {title} (неактивен)"
 
 
 def _build_single_button(label: str) -> list[list[Button]]:
@@ -350,48 +368,16 @@ def setup_account_commands(client, context: BotContext) -> None:
         if not event.is_private:
             return
 
-        active_sessions, inactive_sessions = await context.session_manager.refresh_owner_sessions(event.sender_id)
-
-        verified_active: list[TelethonSession] = []
-        verified_inactive: list[TelethonSession] = []
-
-        for session in inactive_sessions:
-            session.is_active = False
-            verified_inactive.append(session)
-            await context.auto_broadcast_service.mark_account_inactive(
-                session.session_id,
-                owner_id=session.owner_id,
-                reason="session_validation_failed",
-                metadata=session.metadata,
+        user_id = event.sender_id
+        try:
+            sessions_ordered = await context.session_repository.list_sessions_for_owner(user_id)
+        except Exception:
+            logger.exception("Failed to load sessions for account overview", extra={"user_id": user_id})
+            await event.respond(
+                "Не удалось загрузить список аккаунтов. Попробуйте позже.",
+                buttons=build_main_menu_keyboard(),
             )
-
-        for session in active_sessions:
-            has_dialogs = await context.session_manager.ensure_dialog_access(session)
-            if has_dialogs:
-                session.is_active = True
-                verified_active.append(session)
-                await context.auto_broadcast_service.mark_account_active(
-                    session.session_id,
-                    owner_id=session.owner_id,
-                    metadata=session.metadata,
-                )
-            else:
-                session.is_active = False
-                verified_inactive.append(session)
-                await context.auto_broadcast_service.mark_account_inactive(
-                    session.session_id,
-                    owner_id=session.owner_id,
-                    reason="dialog_fetch_failed",
-                    metadata=session.metadata,
-                )
-
-        sessions_ordered: list[TelethonSession] = []
-        seen_ids: set[str] = set()
-        for session in verified_active + verified_inactive:
-            if session.session_id in seen_ids:
-                continue
-            seen_ids.add(session.session_id)
-            sessions_ordered.append(session)
+            return
 
         if not sessions_ordered:
             await event.respond(
@@ -400,14 +386,92 @@ def setup_account_commands(client, context: BotContext) -> None:
             )
             return
 
-        body = "\n".join(_format_session(session) for session in sessions_ordered)
-        note = ""
-        if any(not session.is_active for session in sessions_ordered):
-            note = "\n\nНеактивные аккаунты требуют повторного входа через /login_phone или /login_qr."
-        await event.respond(
-            f"Подключённые аккаунты:\n{body}{note}\n\nНажмите кнопку, чтобы отвязать аккаунт.",
-            buttons=_build_logout_buttons(sessions_ordered),
-        )
+        cached_statuses, pending_sessions = await context.account_status_service.get_cached_snapshot(sessions_ordered)
+        pending_ids = {session.session_id for session in pending_sessions}
+
+        def _render_initial_line(session: TelethonSession) -> str:
+            status = cached_statuses.get(session.session_id)
+            if status is None:
+                pending = session.session_id in pending_ids
+            else:
+                pending = False
+            return _format_session_status(session, cached_statuses.get(session.session_id), pending)
+
+        body = "\n".join(_render_initial_line(session) for session in sessions_ordered)
+        pending_note = "\n\nОбновляем статусы аккаунтов..." if pending_ids else ""
+
+        try:
+            message = await event.respond(
+                (
+                    f"Подключённые аккаунты:\n{body}{pending_note}\n\n"
+                    "Нажмите кнопку, чтобы отвязать аккаунт."
+                ),
+                buttons=_build_logout_buttons(sessions_ordered),
+            )
+        except Exception:
+            logger.exception("Failed to send account status message", extra={"user_id": user_id})
+            return
+
+        prior_states = {session.session_id: session.is_active for session in sessions_ordered}
+
+        async def refresh_and_update() -> None:
+            try:
+                results = await context.account_status_service.refresh_sessions(
+                    sessions_ordered,
+                    verify_dialog_access=True,
+                    use_cache=False,
+                )
+            except Exception:
+                logger.exception("Failed to refresh account statuses", extra={"user_id": user_id})
+                return
+
+            try:
+                lines: list[str] = []
+                any_inactive = False
+                for session in sessions_ordered:
+                    status = results.get(session.session_id)
+                    lines.append(_format_session_status(session, status))
+                    is_active = bool(status and status.active)
+                    previous_active = prior_states.get(session.session_id)
+                    if not is_active:
+                        any_inactive = True
+                    if previous_active == is_active:
+                        continue
+                    if is_active:
+                        await context.auto_broadcast_service.mark_account_active(
+                            session.session_id,
+                            owner_id=session.owner_id,
+                            metadata=session.metadata,
+                        )
+                    else:
+                        await context.auto_broadcast_service.mark_account_inactive(
+                            session.session_id,
+                            owner_id=session.owner_id,
+                            reason=(status.detail if status else "unknown"),
+                            metadata=session.metadata,
+                        )
+            except Exception:
+                logger.exception("Failed to persist refreshed account statuses", extra={"user_id": user_id})
+                return
+
+            note = ""
+            if any_inactive:
+                note = "\n\nНеактивные аккаунты требуют повторного входа через /login_phone или /login_qr."
+
+            updated_body = "\n".join(lines)
+            text = (
+                f"Подключённые аккаунты:\n{updated_body}{note}\n\n"
+                "Нажмите кнопку, чтобы отвязать аккаунт."
+            )
+            try:
+                await message.edit(
+                    text,
+                    buttons=_build_logout_buttons(sessions_ordered),
+                )
+            except Exception:
+                logger.exception("Failed to edit account status message", extra={"user_id": user_id})
+
+        asyncio.create_task(refresh_and_update())
 
     @client.on(events.NewMessage(pattern=LOGIN_PHONE_PATTERN))
     async def handle_login_phone(event: NewMessage.Event) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Iterable, List, Optional, Sequence, Set
 
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo import ReturnDocument
@@ -48,6 +48,8 @@ class AutoBroadcastTaskRepository:
 
     async def create_task(self, task: AutoBroadcastTask) -> AutoBroadcastTask:
         payload = task.model_dump(by_alias=True, exclude_none=True)
+        payload.pop("_id", None)
+        payload.pop("id", None)
         now = datetime.utcnow()
         payload.setdefault("created_at", now)
         payload["updated_at"] = now
@@ -58,17 +60,22 @@ class AutoBroadcastTaskRepository:
         payload["_id"] = str(result.inserted_id)
         return AutoBroadcastTask.model_validate(payload)
 
-    async def replace_task(self, task: AutoBroadcastTask) -> AutoBroadcastTask:
-        payload = task.model_dump(by_alias=True, exclude_none=True)
+    def _serialize_for_update(self, task: AutoBroadcastTask, *, include_none: bool = True) -> dict[str, Any]:
+        payload = task.model_dump(by_alias=True, exclude_none=not include_none)
+        payload.pop("_id", None)
+        payload.pop("id", None)
         payload["updated_at"] = datetime.utcnow()
-        document = await self._collection.find_one_and_replace(
+        return payload
+
+    async def replace_task(self, task: AutoBroadcastTask) -> AutoBroadcastTask:
+        payload = self._serialize_for_update(task)
+        document = await self._collection.find_one_and_update(
             {"task_id": task.task_id},
-            payload,
+            {"$set": payload},
             return_document=ReturnDocument.AFTER,
-            upsert=False,
         )
         if document is None:
-            raise ValueError(f"Task {task.task_id} not found for replacement")
+            raise ValueError(f"Task {task.task_id} not found for update")
         return AutoBroadcastTask.model_validate(self._stringify_object_id(document))
 
     async def get_by_task_id(self, task_id: str) -> Optional[AutoBroadcastTask]:
@@ -309,6 +316,72 @@ class AutoBroadcastTaskRepository:
                 }
             },
         )
+
+    async def remove_accounts_from_task(self, task_id: str, account_ids: Sequence[str]) -> Optional[AutoBroadcastTask]:
+        ids: Set[str] = {account_id for account_id in account_ids if account_id}
+        if not ids:
+            return await self.get_by_task_id(task_id)
+
+        document = await self._collection.find_one({"task_id": task_id})
+        if document is None:
+            return None
+
+        task = AutoBroadcastTask.model_validate(self._stringify_object_id(document))
+        changed = False
+
+        if task.account_id and task.account_id in ids:
+            task.account_id = None
+            changed = True
+
+        if task.account_ids:
+            filtered = [account_id for account_id in task.account_ids if account_id not in ids]
+            if filtered != task.account_ids:
+                task.account_ids = filtered
+                changed = True
+
+        if task.per_account_groups:
+            filtered_groups = {
+                account_id: groups
+                for account_id, groups in task.per_account_groups.items()
+                if account_id not in ids
+            }
+            if len(filtered_groups) != len(task.per_account_groups):
+                task.per_account_groups = filtered_groups
+                changed = True
+
+        if task.groups:
+            filtered_union = [
+                group
+                for group in task.groups
+                if getattr(group, "source_session_id", None) not in ids
+            ]
+            if len(filtered_union) != len(task.groups):
+                task.groups = filtered_union
+                changed = True
+
+        if task.problem_accounts:
+            remaining_problems = [account_id for account_id in task.problem_accounts if account_id not in ids]
+            if remaining_problems != task.problem_accounts:
+                task.problem_accounts = remaining_problems
+                changed = True
+
+        if task.current_account_id and task.current_account_id in ids:
+            task.current_account_id = None
+            changed = True
+
+        if not changed:
+            return task
+
+        task.updated_at = datetime.utcnow()
+        payload = self._serialize_for_update(task)
+        document = await self._collection.find_one_and_update(
+            {"task_id": task_id},
+            {"$set": payload},
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is None:
+            return None
+        return AutoBroadcastTask.model_validate(self._stringify_object_id(document))
 
     async def delete_task(self, task_id: str) -> bool:
         result = await self._collection.delete_one({"task_id": task_id})

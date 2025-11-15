@@ -15,6 +15,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.auto_broadcast import AutoBroadcastService
 from src.services.telethon_manager import TelethonSessionManager
+from src.services.account_status import AccountStatusService
 
 
 @dataclass(slots=True)
@@ -49,6 +50,15 @@ class Application:
                 session_repository=session_repository,
             )
 
+            account_status_service = AccountStatusService(
+                session_manager=telethon_manager,
+                session_repository=session_repository,
+                concurrency=self.settings.account_status_concurrency,
+                timeout_seconds=self.settings.account_status_timeout_seconds,
+                cache_ttl_seconds=self.settings.account_status_cache_ttl_seconds,
+                db_refresh_interval_seconds=self.settings.account_status_db_refresh_seconds,
+            )
+
             worker_id = f"{self.settings.app_name}-{uuid4().hex[:8]}"
             auto_broadcast_service = AutoBroadcastService(
                 task_repository=task_repository,
@@ -60,6 +70,7 @@ class Application:
                 poll_interval=float(self.settings.auto_task_poll_interval_seconds),
                 lock_ttl_seconds=self.settings.auto_task_lock_ttl_seconds,
                 max_delay_per_message=BROADCAST_DELAY_MAX_SECONDS,
+                account_status_service=account_status_service,
             )
 
             await self.bot_application.start(
@@ -67,6 +78,7 @@ class Application:
                 session_repository=session_repository,
                 session_manager=telethon_manager,
                 auto_broadcast_service=auto_broadcast_service,
+                account_status_service=account_status_service,
             )
             stack.push_async_callback(self.bot_application.stop)
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Iterable, Optional
+import time
+from dataclasses import dataclass
+from typing import Dict, Iterable, Optional
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import (
     AuthKeyUnregisteredError,
     SessionRevokedError,
@@ -24,9 +27,25 @@ _SESSION_VALIDATION_TIMEOUT = 5.0
 _AUTH_ERRORS = (
     AuthKeyUnregisteredError,
     SessionRevokedError,
+    SessionPasswordNeededError,
     UserDeactivatedError,
     UserDeactivatedBanError,
 )
+
+
+class _UnauthorizedError(RuntimeError):
+    """Internal marker for unauthorized session state."""
+
+
+@dataclass(slots=True)
+class SessionHealthReport:
+    """Represents the outcome of a Telethon session health probe."""
+
+    ok: bool
+    code: str
+    detail: Optional[str]
+    latency_ms: int
+    exception: Optional[Exception] = None
 
 
 class TelethonSessionManager:
@@ -36,6 +55,9 @@ class TelethonSessionManager:
         self._api_id = api_id
         self._api_hash = api_hash
         self._session_repository = session_repository
+        self._pooled_clients: Dict[str, TelegramClient] = {}
+        self._client_locks: Dict[str, asyncio.Lock] = {}
+        self._pool_guard = asyncio.Lock()
 
     async def create_temporary_client(self) -> TelegramClient:
         """Create and connect a fresh Telethon client for onboarding flows."""
@@ -55,7 +77,139 @@ class TelethonSessionManager:
 
     async def persist_session(self, session: TelethonSession) -> TelethonSession:
         """Persist session metadata and payload to MongoDB."""
-        return await self._session_repository.upsert_session(session)
+        stored = await self._session_repository.upsert_session(session)
+        # Drop pooled client so subsequent checks use refreshed credentials.
+        await self.drop_shared_client(stored.session_id)
+        return stored
+
+    async def _get_client_lock(self, session_id: str) -> asyncio.Lock:
+        async with self._pool_guard:
+            lock = self._client_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._client_locks[session_id] = lock
+            return lock
+
+    async def acquire_shared_client(self, session: TelethonSession) -> TelegramClient:
+        """Get a pooled Telethon client for session health checks."""
+
+        if not session.session_data:
+            raise ValueError("Session data is missing; cannot restore Telethon client")
+
+        lock = await self._get_client_lock(session.session_id)
+        async with lock:
+            client = self._pooled_clients.get(session.session_id)
+            if client is not None:
+                if client.is_connected():
+                    return client
+                with contextlib.suppress(Exception):
+                    await client.connect()
+                    if client.is_connected():
+                        return client
+
+            string_session = StringSession(session.session_data)
+            client = TelegramClient(string_session, self._api_id, self._api_hash)
+            await client.connect()
+            self._pooled_clients[session.session_id] = client
+            return client
+
+    async def drop_shared_client(self, session_id: str) -> None:
+        """Remove a pooled client and close the connection if present."""
+
+        lock = await self._get_client_lock(session_id)
+        client: Optional[TelegramClient] = None
+        async with lock:
+            client = self._pooled_clients.pop(session_id, None)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await self.close_client(client)
+
+    async def check_session_health(
+        self,
+        session: TelethonSession,
+        *,
+        timeout: float,
+        verify_dialog_access: bool,
+    ) -> SessionHealthReport:
+        """Probe a Telethon session for liveness and dialog availability."""
+
+        started_at = time.perf_counter()
+        try:
+            client = await self.acquire_shared_client(session)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            logger.exception(
+                "Failed to acquire pooled Telethon client",
+                extra={"session_id": session.session_id, "owner_id": session.owner_id},
+            )
+            return SessionHealthReport(
+                ok=False,
+                code="client_init_error",
+                detail=exc.__class__.__name__,
+                latency_ms=latency_ms,
+                exception=exc,
+            )
+
+        async def _probe() -> None:
+            authorized = await client.is_user_authorized()
+            if not authorized:
+                raise _UnauthorizedError()
+            await client.get_me()
+            if verify_dialog_access:
+                await client.get_dialogs(limit=1)
+
+        code = "ok"
+        detail: Optional[str] = None
+        error: Optional[Exception] = None
+
+        try:
+            await asyncio.wait_for(_probe(), timeout=timeout)
+        except asyncio.TimeoutError:
+            code = "timeout"
+            detail = f">{timeout:.2f}s"
+        except asyncio.CancelledError:
+            raise
+        except _UnauthorizedError as exc:
+            code = "not_authorized"
+            detail = "client reported unauthorized"
+            error = exc
+            await self.drop_shared_client(session.session_id)
+        except _AUTH_ERRORS as exc:
+            code = "auth_error"
+            detail = exc.__class__.__name__
+            error = exc
+            await self.drop_shared_client(session.session_id)
+        except FloodWaitError as exc:
+            code = "flood_wait"
+            seconds = getattr(exc, "seconds", None)
+            detail = f"{seconds}s" if seconds is not None else exc.__class__.__name__
+            error = exc
+        except RPCError as exc:
+            code = "dialog_error" if verify_dialog_access else "rpc_error"
+            detail = exc.__class__.__name__
+            error = exc
+        except Exception as exc:  # pragma: no cover - defensive
+            code = "dialog_error" if verify_dialog_access else "unexpected_error"
+            detail = exc.__class__.__name__
+            error = exc
+
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        report = SessionHealthReport(ok=code == "ok", code=code, detail=detail, latency_ms=latency_ms, exception=error)
+
+        log_extra = {
+            "session_id": session.session_id,
+            "owner_id": session.owner_id,
+            "status_code": report.code,
+            "status_detail": report.detail,
+            "latency_ms": report.latency_ms,
+        }
+        if report.ok:
+            logger.debug("Session health check succeeded", extra=log_extra)
+        else:
+            level = logging.WARNING if report.code in {"timeout", "not_authorized", "auth_error", "flood_wait", "dialog_error"} else logging.ERROR
+            logger.log(level, "Session health check failed", extra=log_extra)
+
+        return report
 
     async def get_active_sessions(
         self,
@@ -105,48 +259,18 @@ class TelethonSessionManager:
         limit: Optional[int] = None,
     ) -> bool:
         """Ensure account can fetch dialogs; returns True if successful."""
-
-        client: Optional[TelegramClient] = None
-        try:
-            client = await self.build_client_from_session(session)
-        except _AUTH_ERRORS as exc:
-            logger.warning(
-                "Dialog access failed: authorization error",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-        except Exception as exc:
-            logger.exception(
-                "Dialog access failed: client initialization error",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-
-        try:
-            await client.get_dialogs(limit=limit)
-        except _AUTH_ERRORS as exc:
-            logger.warning(
-                "Dialog access failed: authorization error during get_dialogs",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-        except Exception as exc:
-            logger.exception(
-                "Dialog access failed: unexpected error",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-        finally:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await self.close_client(client)
-
-        await self._set_session_active(session, True)
-        return True
+        # The limit parameter is retained for backward compatibility; pooled checks always use a minimal fetch.
+        _ = limit  # pragma: no cover - compatibility no-op
+        report = await self.check_session_health(
+            session,
+            timeout=_SESSION_VALIDATION_TIMEOUT,
+            verify_dialog_access=True,
+        )
+        if report.ok:
+            await self._set_session_active(session, True)
+            return True
+        await self._set_session_active(session, False)
+        return False
 
     async def verify_session_status(
         self,
@@ -155,72 +279,19 @@ class TelethonSessionManager:
         timeout: float = _SESSION_VALIDATION_TIMEOUT,
     ) -> bool:
         """Validate session against Telegram API and persist updated status."""
-
-        client: Optional[TelegramClient] = None
-        try:
-            client = await self.build_client_from_session(session)
-        except _AUTH_ERRORS as exc:
-            logger.warning(
-                "Session authorization error during validation",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-        except Exception as exc:
-            logger.exception(
-                "Failed to rebuild Telethon client for validation",
-                extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-            )
-            await self._set_session_active(session, False)
-            return False
-
-        try:
-            try:
-                authorized = client.is_user_authorized()
-            except Exception as exc:
-                logger.exception(
-                    "Failed to determine authorization state",
-                    extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-                )
-                authorized = False
-
-            if not authorized:
-                logger.warning(
-                    "Session reported as unauthorized",
-                    extra={"session_id": session.session_id, "owner_id": session.owner_id},
-                )
-                await self._set_session_active(session, False)
-                return False
-
-            try:
-                await asyncio.wait_for(client.get_me(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Timed out while validating session",
-                    extra={"session_id": session.session_id, "owner_id": session.owner_id, "timeout": timeout},
-                )
-                # Keep previous state if timeout occurs to avoid flapping due to transient delays.
-                return session.is_active
-            except _AUTH_ERRORS as exc:
-                logger.warning(
-                    "Authorization error while calling get_me",
-                    extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-                )
-                await self._set_session_active(session, False)
-                return False
-            except Exception as exc:
-                logger.exception(
-                    "Unexpected error during session validation",
-                    extra={"session_id": session.session_id, "owner_id": session.owner_id, "error": str(exc)},
-                )
-                return session.is_active
-
+        report = await self.check_session_health(
+            session,
+            timeout=timeout,
+            verify_dialog_access=False,
+        )
+        if report.ok:
             await self._set_session_active(session, True)
             return True
-        finally:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await self.close_client(client)
+        if report.code == "timeout":
+            # Preserve previous state on timeout to avoid flapping.
+            return session.is_active
+        await self._set_session_active(session, False)
+        return False
 
     async def _set_session_active(self, session: TelethonSession, is_active: bool) -> None:
         if session.is_active == is_active:
@@ -239,7 +310,10 @@ class TelethonSessionManager:
         if stored is None:
             return None
         stored.is_active = False
-        return await self._session_repository.upsert_session(stored)
+        updated = await self._session_repository.upsert_session(stored)
+        with contextlib.suppress(Exception):
+            await self.drop_shared_client(session_id)
+        return updated
 
     async def remove_session(self, session: TelethonSession | str) -> bool:
         """Log out the Telethon client and remove the stored session."""
@@ -289,6 +363,8 @@ class TelethonSessionManager:
             )
             return False
 
+        with contextlib.suppress(Exception):
+            await self.drop_shared_client(session_obj.session_id)
         return True
 
     async def close_client(self, client: TelegramClient) -> None:

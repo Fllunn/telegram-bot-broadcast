@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Iterable, Optional, Sequence
 
@@ -7,6 +8,9 @@ from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo import ReturnDocument
 
 from src.models.session import SessionOwnerType, TelethonSession
+
+
+logger = logging.getLogger(__name__)
 
 
 class SessionRepository:
@@ -22,6 +26,9 @@ class SessionRepository:
         metadata = document.get("metadata") or {}
         phone = document.get("phone") or metadata.get("phone")
         document["phone"] = phone or "не указан"
+        document.setdefault("status", None)
+        document.setdefault("last_checked_at", None)
+        document.setdefault("last_error", None)
         return document
 
     async def ensure_indexes(self) -> None:
@@ -30,18 +37,28 @@ class SessionRepository:
 
     async def upsert_session(self, session: TelethonSession) -> TelethonSession:
         payload = session.model_dump(by_alias=True, exclude_none=True)
+        payload.pop("_id", None)
+        payload.pop("id", None)
         created_at = payload.pop("created_at", datetime.utcnow())
         payload["updated_at"] = datetime.utcnow()
 
-        result = await self._collection.find_one_and_update(
-            {"session_id": session.session_id},
-            {
-                "$set": payload,
-                "$setOnInsert": {"created_at": created_at},
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+        try:
+            result = await self._collection.find_one_and_update(
+                {"session_id": session.session_id},
+                {
+                    "$set": payload,
+                    "$setOnInsert": {"created_at": created_at},
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to upsert session document",
+                extra={"session_id": session.session_id, "owner_id": session.owner_id},
+            )
+            raise
+
         if result is None:
             raise RuntimeError("Failed to upsert session document")
         normalized = self._normalize_document(result)
@@ -95,11 +112,45 @@ class SessionRepository:
             {
                 "$set": {
                     "is_active": bool(is_active),
+                    "status": "active" if is_active else "inactive",
                     "updated_at": datetime.utcnow(),
                 }
             },
             return_document=ReturnDocument.AFTER,
         )
+        if document is None:
+            return None
+        normalized = self._normalize_document(document)
+        return TelethonSession.model_validate(normalized)
+
+    async def update_status_fields(
+        self,
+        session_id: str,
+        *,
+        is_active: bool,
+        status: str,
+        last_checked_at: datetime,
+        last_error: Optional[str],
+    ) -> Optional[TelethonSession]:
+        payload = {
+            "is_active": bool(is_active),
+            "status": status,
+            "last_checked_at": last_checked_at,
+            "last_error": last_error,
+            "updated_at": datetime.utcnow(),
+        }
+        try:
+            document = await self._collection.find_one_and_update(
+                {"session_id": session_id},
+                {"$set": payload},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update session status fields",
+                extra={"session_id": session_id},
+            )
+            raise
         if document is None:
             return None
         normalized = self._normalize_document(document)

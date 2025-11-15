@@ -37,6 +37,8 @@ from src.services.broadcast_shared import (
     send_payload_to_group,
 )
 from src.services.telethon_manager import TelethonSessionManager
+from src.services.account_status import AccountStatusService
+from src.utils.timezone import format_moscow_time
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class AutoBroadcastRunner:
         account_repository: AccountRepository,
         session_repository: SessionRepository,
         session_manager: TelethonSessionManager,
+        account_status_service: AccountStatusService,
         bot_client: TelegramClient,
         worker_id: str,
         lock_ttl_seconds: int,
@@ -74,6 +77,7 @@ class AutoBroadcastRunner:
         self._accounts = account_repository
         self._sessions = session_repository
         self._session_manager = session_manager
+        self._account_status_service = account_status_service
         self._bot_client = bot_client
         self._worker_id = worker_id
         self._lock_ttl = lock_ttl_seconds
@@ -83,6 +87,7 @@ class AutoBroadcastRunner:
         self._stop_event = asyncio.Event()
         self._inactive_notified: Set[str] = set()
         self._auth_error_names: Set[str] = {error.__name__ for error in AUTH_ERRORS}
+        self._health_check_interval = 30.0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -185,12 +190,34 @@ class AutoBroadcastRunner:
                     group_index=group_index,
                 )
 
-                sent, failed = await self._process_account(
-                    task,
-                    session,
-                    resume_batch_index=batch_index,
-                    resume_group_index=group_index,
-                )
+                try:
+                    sent, failed = await self._process_account(
+                        task,
+                        session,
+                        resume_batch_index=batch_index,
+                        resume_group_index=group_index,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    sent = 0
+                    failed = 1
+                    logger.exception(
+                        "Auto broadcast account processing failed",
+                        extra={
+                            "task_id": self._task_id,
+                            "user_id": session.owner_id,
+                            "account_id": session.session_id,
+                        },
+                    )
+                    await self._notify_account_inactive(
+                        session_id=session.session_id,
+                        owner_id=session.owner_id,
+                        session=session,
+                        reason=f"unexpected_error: {exc.__class__.__name__}",
+                        task=task,
+                    )
+
                 total_sent += sent
                 total_failed += failed
 
@@ -250,44 +277,50 @@ class AutoBroadcastRunner:
             session = await self._sessions.get_by_session_id(task.account_id)
             if session is None or not session.is_active:
                 return []
-            is_valid = await self._session_manager.verify_session_status(session)
-            if not is_valid:
+            status = await self._account_status_service.refresh_session(
+                session,
+                verify_dialog_access=True,
+                use_cache=False,
+            )
+            if not status.active:
                 await self._notify_account_inactive(
                     session_id=session.session_id,
                     owner_id=session.owner_id,
                     session=session,
-                    reason="необходимо повторно авторизоваться",
+                    reason=status.detail or "необходимо повторно авторизоваться",
+                    task=task,
                 )
                 return []
-            has_dialogs = await self._session_manager.ensure_dialog_access(session)
-            if not has_dialogs:
-                await self._notify_account_inactive(
-                    session_id=session.session_id,
-                    owner_id=session.owner_id,
-                    session=session,
-                    reason="dialog_fetch_failed",
-                )
-                return []
-            session.is_active = True
             return [session]
 
         sessions = await self._session_manager.get_active_sessions(
             task.user_id,
-            verify_live=True,
+            verify_live=False,
         )
         await self._accounts.bulk_sync_accounts(task.user_id, [entry.session_id for entry in sessions])
         filtered_sessions: List[TelethonSession] = []
+        if not sessions:
+            return filtered_sessions
+
+        statuses = await self._account_status_service.refresh_sessions(
+            sessions,
+            verify_dialog_access=True,
+            use_cache=False,
+        )
+
         for session in sessions:
-            has_dialogs = await self._session_manager.ensure_dialog_access(session)
-            if not has_dialogs:
+            status = statuses.get(session.session_id)
+            if status is None or not status.active:
+                reason = status.detail if status else "session_validation_failed"
                 await self._notify_account_inactive(
                     session_id=session.session_id,
                     owner_id=session.owner_id,
                     session=session,
-                    reason="dialog_fetch_failed",
+                    reason=reason,
+                    task=task,
                 )
                 continue
-            session.is_active = True
+            self._clear_inactive_marker(session.session_id)
             filtered_sessions.append(session)
         expected_ids = set(task.account_ids or [])
         live_ids = {session.session_id for session in filtered_sessions}
@@ -297,6 +330,7 @@ class AutoBroadcastRunner:
                 session_id=session_id,
                 owner_id=task.user_id,
                 reason="необходимо повторно авторизоваться",
+                task=task,
             )
         return filtered_sessions
 
@@ -307,9 +341,14 @@ class AutoBroadcastRunner:
         owner_id: int,
         reason: str,
         session: Optional[TelethonSession] = None,
+        task: Optional[AutoBroadcastTask] = None,
     ) -> None:
-        if not session_id or session_id in self._inactive_notified:
+        if not session_id:
             return
+        if session_id in self._inactive_notified:
+            return
+        if not reason:
+            reason = "status_unknown"
         if session is None:
             session = await self._sessions.get_by_session_id(session_id)
         username = None
@@ -324,8 +363,20 @@ class AutoBroadcastRunner:
         else:
             label = session_id
 
-        await self._session_manager.deactivate_session(session_id)
+        try:
+            stored = await self._session_manager.deactivate_session(session_id)
+            if stored is not None and session is not None:
+                session.is_active = stored.is_active
+        except Exception:
+            logger.exception(
+                "Failed to deactivate Telethon session",
+                extra={"account_id": session_id, "owner_id": owner_id},
+            )
+
         self._inactive_notified.add(session_id)
+        if session is not None:
+            session.is_active = False
+
         try:
             state = await self._accounts.mark_inactive(session_id, reason=reason)
             if state is None and session is not None:
@@ -342,9 +393,31 @@ class AutoBroadcastRunner:
                 "Failed to persist inactive account state",
                 extra={"account_id": session_id, "owner_id": owner_id, "reason": reason},
             )
-        await self._tasks.add_problem_account(self._task_id, session_id)
-        await self._tasks.update_status(self._task_id, status=TaskStatus.PAUSED, enabled=False)
-        self.stop()
+        try:
+            await self._tasks.add_problem_account(self._task_id, session_id)
+        except Exception:
+            logger.exception(
+                "Failed to record problem account",
+                extra={"account_id": session_id, "task_id": self._task_id},
+            )
+
+        pruned_task: Optional[AutoBroadcastTask] = None
+        try:
+            pruned_task = await self._tasks.remove_accounts_from_task(self._task_id, [session_id])
+        except Exception:
+            logger.exception(
+                "Failed to prune inactive account from task",
+                extra={"account_id": session_id, "task_id": self._task_id},
+            )
+        else:
+            if pruned_task is not None and task is not None:
+                task.account_id = pruned_task.account_id
+                task.account_ids = list(pruned_task.account_ids)
+                task.per_account_groups = dict(pruned_task.per_account_groups)
+                task.current_account_id = pruned_task.current_account_id
+                task.problem_accounts = list(pruned_task.problem_accounts)
+                task.groups = list(pruned_task.groups)
+
         logger.warning(
             "Auto broadcast account became inactive",
             extra={
@@ -356,6 +429,10 @@ class AutoBroadcastRunner:
         )
         message = f"Аккаунт {label} стал неактивным, войдите снова."
         await self._safe_notify_user(owner_id, message)
+
+    def _clear_inactive_marker(self, session_id: str) -> None:
+        if session_id:
+            self._inactive_notified.discard(session_id)
 
     @staticmethod
     def _is_auth_error(exc: Exception) -> bool:
@@ -379,9 +456,11 @@ class AutoBroadcastRunner:
         state = await self._accounts.get_by_account_id(session.session_id)
         if state is None:
             await self._accounts.upsert_account(session.session_id, session.owner_id, session_id=session.session_id)
+            self._clear_inactive_marker(session.session_id)
             return True
         if state.status == AccountStatus.INACTIVE:
             await self._accounts.mark_active(session.session_id)
+            self._clear_inactive_marker(session.session_id)
             return True
         if state.status == AccountStatus.BLOCKED:
             logger.warning(
@@ -398,6 +477,9 @@ class AutoBroadcastRunner:
                 )
                 return False
             await self._accounts.clear_cooldown(session.session_id)
+            self._clear_inactive_marker(session.session_id)
+            return True
+        self._clear_inactive_marker(session.session_id)
         return True
 
     def _groups_for_session(self, task: AutoBroadcastTask, session_id: str) -> List[GroupTarget]:
@@ -414,6 +496,8 @@ class AutoBroadcastRunner:
         resume_batch_index: int,
         resume_group_index: int,
     ) -> Tuple[int, int]:
+        self._clear_inactive_marker(session.session_id)
+        client: Optional[TelegramClient] = None
         try:
             client = await self._session_manager.build_client_from_session(session)
         except Exception as exc:
@@ -426,8 +510,10 @@ class AutoBroadcastRunner:
                 owner_id=session.owner_id,
                 session=session,
                 reason=f"ошибка восстановления сессии: {exc.__class__.__name__}",
+                task=task,
             )
             return 0, 0
+
         sent = 0
         failed = 0
         dialogs_cache: dict[str, list[object]] = {}
@@ -435,18 +521,47 @@ class AutoBroadcastRunner:
         resume_index = max(0, resume_batch_index * batch_size + resume_group_index)
         message_counter = resume_index
         account_label = session.display_name()
+        session_inactive = False
+        last_health_check = 0.0
+
+        async def _ensure_account_active(force: bool = False) -> bool:
+            nonlocal last_health_check, session_inactive
+            now = time.monotonic()
+            if not force and now - last_health_check < self._health_check_interval:
+                return True
+            last_health_check = now
+            status = await self._account_status_service.refresh_session(
+                session,
+                verify_dialog_access=False,
+                use_cache=False,
+            )
+            if status.active:
+                self._clear_inactive_marker(session.session_id)
+                return True
+            await self._notify_account_inactive(
+                session_id=session.session_id,
+                owner_id=session.owner_id,
+                session=session,
+                reason=status.detail or "session_health_failed",
+                task=task,
+            )
+            session_inactive = True
+            return False
+
         try:
             groups = self._groups_for_session(task, session.session_id)
             if not groups:
                 logger.warning(
-                    "No groups configured for account", extra={"task_id": task.task_id, "account_id": session.session_id}
+                    "No groups configured for account",
+                    extra={"task_id": task.task_id, "account_id": session.session_id},
                 )
                 return sent, failed
 
             text, image_data = self._prepare_materials(session)
             if not text and image_data is None:
                 logger.warning(
-                    "Account %s has no broadcast materials, skipping", session.session_id
+                    "Account %s has no broadcast materials, skipping",
+                    session.session_id,
                 )
                 await self._safe_notify_user(
                     session.owner_id,
@@ -455,10 +570,15 @@ class AutoBroadcastRunner:
                 return sent, failed
             content_description = describe_content_payload(bool(text), image_data is not None)
 
+            if not await _ensure_account_active(force=True):
+                return sent, failed
+
             for index, group in enumerate(groups):
                 if index < resume_index:
                     continue
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or session_inactive:
+                    break
+                if not await _ensure_account_active():
                     break
 
                 group_payload: Mapping[str, object] = group.model_dump(mode="python", by_alias=True)
@@ -478,6 +598,7 @@ class AutoBroadcastRunner:
                         owner_id=session.owner_id,
                         session=session,
                         reason=f"ошибка получения диалогов: {exc.error_type}",
+                        task=task,
                     )
                     return sent, failed
                 except Exception as exc:
@@ -487,6 +608,7 @@ class AutoBroadcastRunner:
                             owner_id=session.owner_id,
                             session=session,
                             reason=f"ошибка доступа к чатам: {exc.__class__.__name__}",
+                            task=task,
                         )
                         return sent, failed
                     failed += 1
@@ -520,7 +642,7 @@ class AutoBroadcastRunner:
                     continue
 
                 for target_index, target in enumerate(targets):
-                    if self._stop_event.is_set():
+                    if self._stop_event.is_set() or session_inactive:
                         break
 
                     payload_text = self._append_suffix(text)
@@ -558,6 +680,7 @@ class AutoBroadcastRunner:
                                 owner_id=session.owner_id,
                                 session=session,
                                 reason=f"ошибка отправки сообщения: {reason}",
+                                task=task,
                             )
                             return sent, failed
                         failed += 1
@@ -596,10 +719,11 @@ class AutoBroadcastRunner:
                         },
                     )
 
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or session_inactive:
                     break
         finally:
-            await self._session_manager.close_client(client)
+            if client is not None:
+                await self._session_manager.close_client(client)
         return sent, failed
 
     def _prepare_materials(self, session: TelethonSession) -> Tuple[Optional[str], Optional[BroadcastImageData]]:
@@ -686,11 +810,12 @@ class AutoBroadcastRunner:
         duration_seconds: float,
         next_run_ts: datetime,
     ) -> None:
+        formatted_next_run = format_moscow_time(next_run_ts)
         summary = (
             "✅ Цикл автосообщений завершён.\n"
             f"Успешно: {sent}, ошибок: {failed}.\n"
             f"Длительность: {self._format_duration(duration_seconds)}.\n"
-            f"Следующий запуск: {next_run_ts:%d.%m %H:%M:%S}"
+            f"Следующий запуск: {formatted_next_run}"
         )
         logger.info(
             "Auto broadcast cycle completed",

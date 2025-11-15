@@ -30,6 +30,9 @@ class TelethonSession(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    status: Optional[str] = None
+    last_checked_at: Optional[datetime] = None
+    last_error: Optional[str] = None
 
     def display_name(self) -> str:
         username = self.metadata.get("username") if self.metadata else None

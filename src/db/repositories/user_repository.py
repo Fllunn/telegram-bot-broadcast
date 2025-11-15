@@ -20,6 +20,8 @@ class UserRepository:
 
     async def upsert_user(self, user: User) -> User:
         payload = user.model_dump(by_alias=True, exclude_none=True)
+        payload.pop("_id", None)
+        payload.pop("id", None)
         created_at = payload.pop("created_at", datetime.utcnow())
         payload["updated_at"] = datetime.utcnow()
 

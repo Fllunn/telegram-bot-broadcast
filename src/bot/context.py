@@ -6,6 +6,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.auth_state import AuthStateManager
 from src.services.auto_broadcast import AutoBroadcastService
+from src.services.account_status import AccountStatusService
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
@@ -24,3 +25,4 @@ class BotContext:
     groups_manager: GroupUploadStateManager
     group_view_manager: GroupViewStateManager
     auto_broadcast_service: AutoBroadcastService
+    account_status_service: AccountStatusService

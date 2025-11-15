@@ -20,11 +20,12 @@ from src.services.auto_broadcast.state_manager import (
     AutoTaskSetupState,
     AutoTaskSetupStep,
 )
+from src.utils.timezone import format_moscow_time
 
 
 logger = logging.getLogger(__name__)
 
-AUTO_SCHEDULE_PATTERN = r"^(?:/auto_schedule(?:@\w+)?|Автозадача)$"
+AUTO_SCHEDULE_PATTERN = r"^(?:/auto_schedule(?:@\w+)?|Авторассылка)$"
 AUTO_STATUS_PATTERN = r"^/auto_status(?:@\w+)?$"
 AUTO_PAUSE_PATTERN = r"^/auto_pause(?:@\w+)?(\s+\S+)?$"
 AUTO_RESUME_PATTERN = r"^/auto_resume(?:@\w+)?(\s+\S+)?$"
@@ -45,9 +46,9 @@ STOP_SELECT_CALLBACK = "auto_stop_select"
 STOP_SINGLE_OPTION = "single"
 STOP_ALL_OPTION = "all"
 
-STOP_MENU_PROMPT = "Выберите, что остановить:\n• Только для этого аккаунта\n• Все автозадачи"
+STOP_MENU_PROMPT = "Выберите, что остановить:\n• Только для этого аккаунта\n• Все авторассылки"
 STOP_SINGLE_LABEL = "Только для этого аккаунта"
-STOP_ALL_LABEL = "Все автозадачи"
+STOP_ALL_LABEL = "Все авторассылки"
 
 
 @dataclass(frozen=True)
@@ -179,7 +180,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 extra={"user_id": event.sender_id, "fsm_step": fsm_step.value},
             )
             await event.respond(
-                "Нет сохранённого текста или изображения для автозадачи. Добавьте материалы и попробуйте снова.",
+                "Нет сохранённого текста или изображения для авторассылки. Добавьте материалы и попробуйте снова.",
                 buttons=build_main_menu_keyboard(),
             )
             state_manager.clear(event.sender_id)
@@ -192,7 +193,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 extra={"user_id": event.sender_id, "fsm_step": fsm_step.value},
             )
             await event.respond(
-                "Нет доступных групп для автозадачи. Добавьте группы и попробуйте снова.",
+                "Нет доступных групп для авторассылки. Добавьте группы и попробуйте снова.",
                 buttons=build_main_menu_keyboard(),
             )
             state_manager.clear(event.sender_id)
@@ -207,7 +208,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             total_groups=total_groups,
         )
         message = await event.respond(
-            "Выберите режим автозадачи:\n"
+            "Выберите режим авторассылки:\n"
             "• Один аккаунт — рассылка всегда от выбранного аккаунта.\n"
             "• Все аккаунты — перед каждым циклом порядок аккаунтов будет перемешан.",
             buttons=[
@@ -406,17 +407,10 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     def _humanize_next_run(next_run: Optional[datetime], *, with_exact: bool = True) -> str:
         if next_run is None:
             return "не запланирован" if with_exact else "—"
-        now = datetime.utcnow()
-        delta_seconds = (next_run - now).total_seconds()
-        relative = "сейчас" if delta_seconds <= 0 else _humanize_seconds(delta_seconds)
-        if not with_exact:
-            return relative
-        return f"{relative} ({next_run:%d.%m %H:%M})"
+        return format_moscow_time(next_run)
 
     def _format_next_run_compact(next_run: Optional[datetime]) -> str:
-        if next_run is None:
-            return "—"
-        return f"{next_run:%d.%m %H:%M}"
+        return format_moscow_time(next_run)
 
     def _format_task_summary(task: AutoBroadcastTask, labels: Mapping[str, str]) -> str:
         icon, status_text = _status_descriptor(task.status)
@@ -491,7 +485,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 return None
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception(
-                "Не удалось обновить состояние автозадачи",
+                "Не удалось обновить состояние авторассылки",
                 extra={"task_id": task_id, "user_id": user_id, "action": action, "error": str(exc)},
             )
             return None
@@ -503,7 +497,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return
         tasks = await service.list_tasks_for_user(event.sender_id)
         if not tasks:
-            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных авторассылок.", buttons=build_main_menu_keyboard())
             return
         applicable = [task for task in tasks if _is_task_applicable(task, action)]
         if not applicable:
@@ -558,16 +552,16 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             await event.respond(str(exc), buttons=build_main_menu_keyboard())
             return
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("Не удалось создать автозадачу", exc_info=exc, extra={"user_id": event.sender_id})
+            logger.exception("Не удалось создать авторассылку", exc_info=exc, extra={"user_id": event.sender_id})
             await event.respond(
-                "Не удалось создать автозадачу: {0}".format(exc),
+                "Не удалось создать авторассылку: {0}".format(exc),
                 buttons=build_main_menu_keyboard(),
             )
             return
         state_manager.clear(event.sender_id)
         labels = await _build_account_label_map(event.sender_id, [task])
         await event.respond(
-            "Автозадача создана и запущена.\n{0}".format(_format_task_summary(task, labels)),
+            "Авторассылка создана и запущена.\n{0}".format(_format_task_summary(task, labels)),
             buttons=build_main_menu_keyboard(),
         )
 
@@ -588,12 +582,12 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         notify_line = "Включены" if state.notify_each_cycle else "Выключены"
         interval = service.humanize_interval(state.user_interval_seconds or 0)
         return (
-            "Проверьте параметры автозадачи:\n"
+            "Проверьте параметры авторассылки:\n"
             f"Режим: {'все аккаунты' if state.account_mode == AccountMode.ALL else 'один аккаунт'}\n"
             f"Аккаунты: {account_line}\n"
             f"Интервал между циклами: {interval}\n"
             f"Уведомления: {notify_line}\n\n"
-            "Нажмите 'Создать', чтобы запустить автозадачу."
+            "Нажмите 'Создать', чтобы запустить авторассылку."
         )
 
     async def _update_confirmation_message(event: CallbackQuery.Event, state: AutoTaskSetupState) -> None:
@@ -617,7 +611,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         sessions = await service.load_active_sessions(event.sender_id, ensure_fresh_metadata=True)
         if not sessions:
             await event.respond(
-                "Нет активных аккаунтов для настройки автозадачи. Подключите аккаунт и повторите.",
+                "Нет активных аккаунтов для настройки авторассылки. Подключите аккаунт и повторите.",
                 buttons=build_main_menu_keyboard(),
             )
             return
@@ -629,7 +623,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return
         tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
         if not tasks:
-            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных авторассылок.", buttons=build_main_menu_keyboard())
             return
         if len(tasks) == 1:
             stopped, requested = await service.stop_tasks(
@@ -637,7 +631,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 task_ids=[tasks[0].task_id],
             )
             if stopped <= 0:
-                await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+                await event.respond("Нет активных авторассылок.", buttons=build_main_menu_keyboard())
                 return
             message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
             await event.respond(message, buttons=build_main_menu_keyboard())
@@ -665,7 +659,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 label = f"{label_name} ({count} групп)"
                 buttons.append([Button.inline(label, f"{SELECT_CALLBACK}:{account_id}".encode("utf-8"))])
             buttons.append([Button.inline("Отмена", f"{CANCEL_CALLBACK}:accounts".encode("utf-8"))])
-            message = await event.edit("Выберите аккаунт для автозадачи:", buttons=buttons)
+            message = await event.edit("Выберите аккаунт для авторассылки:", buttons=buttons)
             state_manager.update(event.sender_id, step=AutoTaskSetupStep.CHOOSING_ACCOUNT, last_message_id=message.id)
         else:
             minimum = _minimum_seconds_for_state(event.sender_id, state)
@@ -756,7 +750,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if not _state_ready_for_confirmation(state):
             await event.answer("Заполните все шаги.", alert=True)
             return
-        await event.answer("Создаю задачу...")
+        await event.answer("Создаю авторассылку...")
         await _finalize_creation(event, state)
 
     @client.on(events.CallbackQuery(pattern=rf"^{CANCEL_CALLBACK}:".encode("utf-8")))
@@ -764,7 +758,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         state = state_manager.clear(event.sender_id)
         await event.answer("Отменено.")
         with contextlib.suppress(Exception):
-            await event.edit("Автозадача отменена.")
+            await event.edit("Авторассылка отменена.")
         await event.respond("Возвращаюсь в главное меню.", buttons=build_main_menu_keyboard())
 
     @client.on(events.CallbackQuery(pattern=rf"^{STOP_MENU_CALLBACK}:".encode("utf-8")))
@@ -781,11 +775,11 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if option == STOP_SINGLE_OPTION:
             tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
             if not tasks:
-                await event.answer("Нет активных автозадач.", alert=True)
+                await event.answer("Нет активных авторассылок.", alert=True)
                 await _finalize_stop_callback(
                     event,
-                    message="Нет активных автозадач.",
-                    edit_text="Нет активных автозадач.",
+                    message="Нет активных авторассылок.",
+                    edit_text="Нет активных авторассылок.",
                 )
                 return
             if len(tasks) == 1:
@@ -797,8 +791,8 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 if stopped <= 0:
                     await _finalize_stop_callback(
                         event,
-                        message="Нет активных автозадач.",
-                        edit_text="Нет активных автозадач.",
+                        message="Нет активных авторассылок.",
+                        edit_text="Нет активных авторассылок.",
                     )
                     return
                 message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
@@ -822,11 +816,11 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if option == STOP_ALL_OPTION:
             tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
             if not tasks:
-                await event.answer("Нет активных автозадач.", alert=True)
+                await event.answer("Нет активных авторассылок.", alert=True)
                 await _finalize_stop_callback(
                     event,
-                    message="Нет активных автозадач.",
-                    edit_text="Нет активных автозадач.",
+                    message="Нет активных авторассылок.",
+                    edit_text="Нет активных авторассылок.",
                 )
                 return
             await event.answer("Останавливаю…")
@@ -837,8 +831,8 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             if stopped <= 0:
                 await _finalize_stop_callback(
                     event,
-                    message="Нет активных автозадач.",
-                    edit_text="Нет активных автозадач.",
+                    message="Нет активных авторассылок.",
+                    edit_text="Нет активных авторассылок.",
                 )
                 return
             message = _build_stop_result_message(stopped, requested) or "Авторассылка остановлена."
@@ -920,12 +914,12 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             return
         tasks = await service.list_tasks_for_user(event.sender_id, active_only=True)
         if not tasks:
-            await event.respond("Нет активных автозадач.", buttons=build_main_menu_keyboard())
+            await event.respond("Нет активных авторассылок.", buttons=build_main_menu_keyboard())
             return
         labels = await _build_account_label_map(event.sender_id, tasks)
         blocks = [f"{idx}.\n{_format_task_summary(task, labels)}" for idx, task in enumerate(tasks, start=1)]
         body = "\n\n".join(blocks)
-        await event.respond(f"Автозадачи:\n\n{body}", buttons=build_main_menu_keyboard())
+        await event.respond(f"Авторассылки:\n\n{body}", buttons=build_main_menu_keyboard())
 
     @client.on(events.NewMessage(pattern=AUTO_PAUSE_PATTERN))
     async def handle_pause(event: NewMessage.Event) -> None:

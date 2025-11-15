@@ -6,6 +6,7 @@ import binascii
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence, Set
 
@@ -54,6 +55,8 @@ from src.services.broadcast_shared import (
 
 
 CANCEL_LABEL = "Отмена"
+
+ACCOUNT_HEALTH_CHECK_INTERVAL = 30.0
 
 SCOPE_PREFIX = "scope"
 SCOPE_SINGLE = "single"
@@ -595,6 +598,8 @@ async def _build_broadcast_plan(
 	errors: list[str] = []
 	total_groups = 0
 	seen_session_ids: set[str] = set()
+	session_candidates: list[TelethonSession] = []
+	session_labels: dict[str, str] = {}
 	for session_id in session_ids:
 		if not session_id or session_id in seen_session_ids:
 			continue
@@ -615,17 +620,33 @@ async def _build_broadcast_plan(
 		if session is None or session.owner_id != user_id:
 			errors.append("Выбранный аккаунт недоступен или был удалён.")
 			continue
-		label = _render_session_label(session)
-		is_live = await context.session_manager.verify_session_status(session)
-		if not is_live:
+		session_candidates.append(session)
+		session_labels[session.session_id] = _render_session_label(session)
+
+	if session_candidates:
+		status_results = await context.account_status_service.refresh_sessions(
+			session_candidates,
+			verify_dialog_access=True,
+			use_cache=False,
+		)
+	else:
+		status_results = {}
+
+	for session in list(session_candidates):
+		status = status_results.get(session.session_id)
+		label = session_labels.get(session.session_id, _render_session_label(session))
+		if status is None or not status.active:
 			await context.session_manager.deactivate_session(session.session_id)
 			await context.auto_broadcast_service.mark_account_inactive(
 				session.session_id,
 				owner_id=session.owner_id,
-				reason="session_validation_failed",
+				reason=(status.detail if status else "session_validation_failed"),
 				metadata=session.metadata,
 			)
-			errors.append(f"Аккаунт {label} стал неактивным, войдите снова.")
+			errors.append(
+				f"Аккаунт {label} стал неактивным"
+				+ (f": {status.reason}" if status and status.reason else ".")
+			)
 			stored_sessions.pop(session.session_id, None)
 			continue
 		await context.auto_broadcast_service.mark_account_active(
@@ -919,6 +940,34 @@ async def _execute_broadcast_plan(
 					break
 				continue
 
+			health_last_checked = 0.0
+
+			async def _ensure_account_active(force: bool = False) -> bool:
+				nonlocal health_last_checked, session_inactive
+				now = time.monotonic()
+				if not force and now - health_last_checked < ACCOUNT_HEALTH_CHECK_INTERVAL:
+					return True
+				health_last_checked = now
+				try:
+					status = await context.account_status_service.refresh_session(
+						entry.session,
+						verify_dialog_access=False,
+						use_cache=False,
+					)
+				except Exception:
+					logger.exception(
+						"Failed to refresh account health during broadcast",
+						extra={"user_id": user_id, "session_id": entry.session.session_id},
+					)
+					status = None
+				if status and status.active:
+					return True
+				reason = status.detail if status and status.detail else "health_check_failed"
+				label = await _handle_session_inactive(entry.session, reason)
+				session_inactive = True
+				await _update_progress(f"Аккаунт {label} стал неактивным, пропускаем")
+				return False
+
 			try:
 				session_key = entry.session.session_id
 				session_image = image_cache.get(session_key)
@@ -954,10 +1003,15 @@ async def _execute_broadcast_plan(
 						break
 					continue
 
+				if not await _ensure_account_active(force=True):
+					continue
+
 				for group in entry.groups:
 					if session_inactive:
 						break
 					if _is_cancelled() or session_inactive:
+						break
+					if not await _ensure_account_active():
 						break
 
 					current_chat_label = _render_group_label(group)
@@ -1011,6 +1065,8 @@ async def _execute_broadcast_plan(
 						if session_inactive:
 							break
 						if _is_cancelled():
+							break
+						if not await _ensure_account_active():
 							break
 
 						current_chat_label = target.label

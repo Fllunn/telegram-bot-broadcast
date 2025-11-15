@@ -14,6 +14,7 @@ from src.db.repositories.session_repository import SessionRepository
 from src.models.auto_broadcast import AutoBroadcastTask, TaskStatus
 from src.services.auto_broadcast.runner import AutoBroadcastRunner
 from src.services.telethon_manager import TelethonSessionManager
+from src.services.account_status import AccountStatusService
 
 
 logger = logging.getLogger(__name__)
@@ -54,11 +55,13 @@ class AutoBroadcastSupervisor:
         max_restart_attempts: int = 5,
         base_backoff: float = 5.0,
         max_backoff: float = 300.0,
+        account_status_service: AccountStatusService,
     ) -> None:
         self._tasks = task_repository
         self._accounts = account_repository
         self._sessions = session_repository
         self._session_manager = session_manager
+        self._account_status_service = account_status_service
         self._bot_client = bot_client
         self._worker_id = worker_id
         self._lock_ttl = lock_ttl_seconds
@@ -145,11 +148,13 @@ class AutoBroadcastSupervisor:
         account_ids = self._collect_account_ids(task)
         if not account_ids:
             return True
+        active_found = False
         for account_id in account_ids:
             session = await self._sessions.get_by_session_id(account_id)
-            if session is None or not session.is_active:
-                return True
-        return False
+            if session is not None and session.is_active:
+                active_found = True
+                break
+        return not active_found
 
     @staticmethod
     def _collect_account_ids(task: AutoBroadcastTask) -> List[str]:
@@ -172,6 +177,7 @@ class AutoBroadcastSupervisor:
             account_repository=self._accounts,
             session_repository=self._sessions,
             session_manager=self._session_manager,
+            account_status_service=self._account_status_service,
             bot_client=self._bot_client,
             worker_id=self._worker_id,
             lock_ttl_seconds=int(self._lock_ttl),
