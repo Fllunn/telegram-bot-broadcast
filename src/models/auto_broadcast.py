@@ -29,6 +29,7 @@ class AccountStatus(str, Enum):
     ACTIVE = "active"
     BLOCKED = "blocked"
     COOLDOWN = "cooldown"
+    INACTIVE = "inactive"
 
 
 class RetryPolicy(BaseModel):

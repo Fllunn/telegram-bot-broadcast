@@ -7,9 +7,15 @@ import math
 import random
 import time
 from datetime import datetime, timedelta
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from telethon import TelegramClient
+from telethon.errors.rpcerrorlist import (
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
 
 from src.config.broadcast_settings import (
     BROADCAST_BATCH_PAUSE_SECONDS,
@@ -24,6 +30,7 @@ from src.models.session import TelethonSession
 from src.services.auto_broadcast.payloads import ImagePayload, extract_image_metadata, prepare_image_payload
 from src.services.broadcast_shared import (
     BroadcastImageData,
+    DialogsFetchError,
     describe_content_payload,
     render_group_label,
     resolve_group_targets,
@@ -36,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 ANTISPAM_SUFFIXES: Sequence[str] = ("\u2060", "\u200B", "\u200C", " .", " …", " 🙂")
 SHUFFLE_RANDOM = random.SystemRandom()
+AUTH_ERRORS: Tuple[type[BaseException], ...] = (
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
 
 
 class AutoBroadcastRunner:
@@ -68,6 +81,8 @@ class AutoBroadcastRunner:
         self._batch_pause_max = batch_pause_max_seconds
         self._interval_margin = interval_safety_margin_seconds
         self._stop_event = asyncio.Event()
+        self._inactive_notified: Set[str] = set()
+        self._auth_error_names: Set[str] = {error.__name__ for error in AUTH_ERRORS}
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -235,15 +250,127 @@ class AutoBroadcastRunner:
             session = await self._sessions.get_by_session_id(task.account_id)
             if session is None or not session.is_active:
                 return []
+            is_valid = await self._session_manager.verify_session_status(session)
+            if not is_valid:
+                await self._notify_account_inactive(
+                    session_id=session.session_id,
+                    owner_id=session.owner_id,
+                    session=session,
+                    reason="необходимо повторно авторизоваться",
+                )
+                return []
+            has_dialogs = await self._session_manager.ensure_dialog_access(session)
+            if not has_dialogs:
+                await self._notify_account_inactive(
+                    session_id=session.session_id,
+                    owner_id=session.owner_id,
+                    session=session,
+                    reason="dialog_fetch_failed",
+                )
+                return []
+            session.is_active = True
             return [session]
 
-        sessions_iter = await self._session_manager.get_active_sessions(task.user_id)
-        sessions = list(sessions_iter)
+        sessions = await self._session_manager.get_active_sessions(
+            task.user_id,
+            verify_live=True,
+        )
         await self._accounts.bulk_sync_accounts(task.user_id, [entry.session_id for entry in sessions])
-        return sessions
+        filtered_sessions: List[TelethonSession] = []
+        for session in sessions:
+            has_dialogs = await self._session_manager.ensure_dialog_access(session)
+            if not has_dialogs:
+                await self._notify_account_inactive(
+                    session_id=session.session_id,
+                    owner_id=session.owner_id,
+                    session=session,
+                    reason="dialog_fetch_failed",
+                )
+                continue
+            session.is_active = True
+            filtered_sessions.append(session)
+        expected_ids = set(task.account_ids or [])
+        live_ids = {session.session_id for session in filtered_sessions}
+        missing = [session_id for session_id in expected_ids if session_id and session_id not in live_ids]
+        for session_id in missing:
+            await self._notify_account_inactive(
+                session_id=session_id,
+                owner_id=task.user_id,
+                reason="необходимо повторно авторизоваться",
+            )
+        return filtered_sessions
+
+    async def _notify_account_inactive(
+        self,
+        *,
+        session_id: str,
+        owner_id: int,
+        reason: str,
+        session: Optional[TelethonSession] = None,
+    ) -> None:
+        if not session_id or session_id in self._inactive_notified:
+            return
+        if session is None:
+            session = await self._sessions.get_by_session_id(session_id)
+        username = None
+        if session and isinstance(session.metadata, Mapping):
+            raw_username = session.metadata.get("username")
+            if isinstance(raw_username, str) and raw_username.strip():
+                username = raw_username.strip()
+        if username:
+            label = f"@{username.lstrip('@')}"
+        elif session is not None:
+            label = session.display_name() or session.session_id
+        else:
+            label = session_id
+
+        await self._session_manager.deactivate_session(session_id)
+        self._inactive_notified.add(session_id)
+        try:
+            state = await self._accounts.mark_inactive(session_id, reason=reason)
+            if state is None and session is not None:
+                await self._accounts.upsert_account(
+                    session_id,
+                    owner_id,
+                    session_id=session_id,
+                    status=AccountStatus.INACTIVE,
+                    blocked_reason=reason,
+                    metadata=session.metadata,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist inactive account state",
+                extra={"account_id": session_id, "owner_id": owner_id, "reason": reason},
+            )
+        await self._tasks.add_problem_account(self._task_id, session_id)
+        await self._tasks.update_status(self._task_id, status=TaskStatus.PAUSED, enabled=False)
+        self.stop()
+        logger.warning(
+            "Auto broadcast account became inactive",
+            extra={
+                "task_id": self._task_id,
+                "user_id": owner_id,
+                "account_id": session_id,
+                "reason": reason,
+            },
+        )
+        message = f"Аккаунт {label} стал неактивным, войдите снова."
+        await self._safe_notify_user(owner_id, message)
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        return isinstance(exc, AUTH_ERRORS)
+
+    def _is_auth_error_reason(self, reason: Optional[str]) -> bool:
+        if not reason:
+            return False
+        return reason in self._auth_error_names
 
     async def _handle_no_sessions(self, task: AutoBroadcastTask) -> None:
-        message = "Нет доступных аккаунтов для выполнения автозадачи."
+        message = (
+            "Нет доступных аккаунтов для выполнения автозадачи. "
+            "Авторизуйтесь снова через /login_phone или /login_qr."
+        )
         await self._tasks.set_error_state(task.task_id, message)
         await self._safe_notify_user(task.user_id, message)
         logger.error(message, extra={"task_id": task.task_id, "user_id": task.user_id})
@@ -252,6 +379,9 @@ class AutoBroadcastRunner:
         state = await self._accounts.get_by_account_id(session.session_id)
         if state is None:
             await self._accounts.upsert_account(session.session_id, session.owner_id, session_id=session.session_id)
+            return True
+        if state.status == AccountStatus.INACTIVE:
+            await self._accounts.mark_active(session.session_id)
             return True
         if state.status == AccountStatus.BLOCKED:
             logger.warning(
@@ -291,9 +421,11 @@ class AutoBroadcastRunner:
                 "Failed to build Telethon client",
                 extra={"task_id": task.task_id, "account_id": session.session_id},
             )
-            await self._safe_notify_user(
-                session.owner_id,
-                f"Не удалось восстановить аккаунт {session.display_name()} для рассылки: {exc}",
+            await self._notify_account_inactive(
+                session_id=session.session_id,
+                owner_id=session.owner_id,
+                session=session,
+                reason=f"ошибка восстановления сессии: {exc.__class__.__name__}",
             )
             return 0, 0
         sent = 0
@@ -340,7 +472,23 @@ class AutoBroadcastRunner:
                         content_type=content_description,
                         dialogs_cache=dialogs_cache,
                     )
+                except DialogsFetchError as exc:
+                    await self._notify_account_inactive(
+                        session_id=session.session_id,
+                        owner_id=session.owner_id,
+                        session=session,
+                        reason=f"ошибка получения диалогов: {exc.error_type}",
+                    )
+                    return sent, failed
                 except Exception as exc:
+                    if self._is_auth_error(exc):
+                        await self._notify_account_inactive(
+                            session_id=session.session_id,
+                            owner_id=session.owner_id,
+                            session=session,
+                            reason=f"ошибка доступа к чатам: {exc.__class__.__name__}",
+                        )
+                        return sent, failed
                     failed += 1
                     await self._tasks.add_problem_account(self._task_id, session.session_id)
                     logger.exception(
@@ -404,6 +552,14 @@ class AutoBroadcastRunner:
                         log_payload["event_type"] = "auto_broadcast_message_sent"
                         logger.info("Auto broadcast message sent", extra=log_payload)
                     else:
+                        if self._is_auth_error_reason(reason):
+                            await self._notify_account_inactive(
+                                session_id=session.session_id,
+                                owner_id=session.owner_id,
+                                session=session,
+                                reason=f"ошибка отправки сообщения: {reason}",
+                            )
+                            return sent, failed
                         failed += 1
                         await self._tasks.add_problem_account(self._task_id, session.session_id)
                         log_payload["event_type"] = "auto_broadcast_message_failed"

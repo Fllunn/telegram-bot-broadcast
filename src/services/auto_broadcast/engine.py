@@ -11,7 +11,7 @@ from telethon import TelegramClient
 from src.db.repositories.account_repository import AccountRepository
 from src.db.repositories.auto_broadcast_task_repository import AutoBroadcastTaskRepository
 from src.db.repositories.session_repository import SessionRepository
-from src.models.auto_broadcast import AccountMode, AutoBroadcastTask, GroupTarget, TaskStatus
+from src.models.auto_broadcast import AccountMode, AccountStatus, AutoBroadcastTask, GroupTarget, TaskStatus
 from src.models.session import TelethonSession
 from src.services.auto_broadcast.state_manager import AutoTaskStateManager
 from src.services.auto_broadcast.supervisor import AutoBroadcastSupervisor
@@ -252,13 +252,34 @@ class AutoBroadcastService:
         return stored
 
     async def load_active_sessions(self, user_id: int, *, ensure_fresh_metadata: bool = False) -> List[TelethonSession]:
-        result = await self._session_manager.get_active_sessions(user_id)
-        sessions = list(result)
+        sessions = await self._session_manager.get_active_sessions(
+            user_id,
+            verify_live=True,
+        )
+        validated: List[TelethonSession] = []
+        for session in sessions:
+            has_dialogs = await self._session_manager.ensure_dialog_access(session)
+            if not has_dialogs:
+                await self._session_manager.deactivate_session(session.session_id)
+                await self.mark_account_inactive(
+                    session.session_id,
+                    owner_id=session.owner_id,
+                    reason="dialog_fetch_failed",
+                    metadata=session.metadata,
+                )
+                continue
+            session.is_active = True
+            await self.mark_account_active(
+                session.session_id,
+                owner_id=session.owner_id,
+                metadata=session.metadata,
+            )
+            validated.append(session)
         if not ensure_fresh_metadata:
-            return sessions
+            return validated
 
         refreshed: List[TelethonSession] = []
-        for session in sessions:
+        for session in validated:
             metadata = session.metadata or {}
             groups = metadata.get("broadcast_groups") if isinstance(metadata, Mapping) else None
             if groups:
@@ -269,9 +290,73 @@ class AutoBroadcastService:
             if latest is None:
                 refreshed.append(session)
                 continue
+            has_dialogs = await self._session_manager.ensure_dialog_access(latest)
+            if not has_dialogs:
+                await self._session_manager.deactivate_session(latest.session_id)
+                await self.mark_account_inactive(
+                    latest.session_id,
+                    owner_id=latest.owner_id,
+                    reason="dialog_fetch_failed",
+                    metadata=latest.metadata,
+                )
+                continue
 
+            latest.is_active = True
+            await self.mark_account_active(
+                latest.session_id,
+                owner_id=latest.owner_id,
+                metadata=latest.metadata,
+            )
             refreshed.append(latest)
         return refreshed
+
+    async def mark_account_active(
+        self,
+        account_id: str,
+        *,
+        owner_id: Optional[int] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        try:
+            state = await self._accounts.mark_active(account_id)
+            if state is None and owner_id is not None:
+                await self._accounts.upsert_account(
+                    account_id,
+                    owner_id,
+                    session_id=account_id,
+                    status=AccountStatus.ACTIVE,
+                    metadata=dict(metadata or {}),
+                )
+        except Exception:
+            logger.exception(
+                "Failed to mark account active",
+                extra={"account_id": account_id, "owner_id": owner_id},
+            )
+
+    async def mark_account_inactive(
+        self,
+        account_id: str,
+        *,
+        owner_id: int,
+        reason: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        try:
+            state = await self._accounts.mark_inactive(account_id, reason=reason)
+            if state is None:
+                await self._accounts.upsert_account(
+                    account_id,
+                    owner_id,
+                    session_id=account_id,
+                    status=AccountStatus.INACTIVE,
+                    blocked_reason=reason,
+                    metadata=dict(metadata or {}),
+                )
+        except Exception:
+            logger.exception(
+                "Failed to mark account inactive",
+                extra={"account_id": account_id, "owner_id": owner_id, "reason": reason},
+            )
 
     def minimum_interval_seconds(self, groups_by_account: Mapping[str, Sequence[GroupTarget]], batch_size: int = 20) -> float:
         return self._calculate_minimum_interval(groups_by_account, batch_size)
@@ -480,8 +565,35 @@ class AutoBroadcastService:
         sessions: List[TelethonSession] = []
         for session_id in session_ids:
             session = await self._sessions.get_by_session_id(session_id)
-            if session is not None and session.owner_id == user_id and session.is_active:
-                sessions.append(session)
+            if session is None or session.owner_id != user_id:
+                continue
+            is_live = await self._session_manager.verify_session_status(session)
+            if not is_live:
+                await self._session_manager.deactivate_session(session.session_id)
+                await self.mark_account_inactive(
+                    session.session_id,
+                    owner_id=session.owner_id,
+                    reason="session_validation_failed",
+                    metadata=session.metadata,
+                )
+                continue
+            has_dialogs = await self._session_manager.ensure_dialog_access(session)
+            if not has_dialogs:
+                await self._session_manager.deactivate_session(session.session_id)
+                await self.mark_account_inactive(
+                    session.session_id,
+                    owner_id=session.owner_id,
+                    reason="dialog_fetch_failed",
+                    metadata=session.metadata,
+                )
+                continue
+            await self.mark_account_active(
+                session.session_id,
+                owner_id=session.owner_id,
+                metadata=session.metadata,
+            )
+            session.is_active = True
+            sessions.append(session)
         if not sessions:
             raise ValueError("Указанные аккаунты недоступны или отключены")
         return sessions
@@ -506,8 +618,11 @@ class AutoBroadcastService:
     async def _clean_user_tasks(self, user_id: int, tasks: List[AutoBroadcastTask]) -> List[AutoBroadcastTask]:
         if not tasks:
             return []
-        active_sessions_iter = await self._session_manager.get_active_sessions(user_id)
-        active_sessions = {session.session_id: session for session in active_sessions_iter}
+        active_session_list = await self._session_manager.get_active_sessions(
+            user_id,
+            verify_live=True,
+        )
+        active_sessions = {session.session_id: session for session in active_session_list}
         tasks_sorted = sorted(
             tasks,
             key=lambda t: (

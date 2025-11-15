@@ -291,14 +291,15 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         username = metadata.get("username") if isinstance(metadata, Mapping) else None
         label = _normalize_username_label(username)
         if label:
-            return label
+            return f"{label} (неактивен)" if not getattr(session, "is_active", True) else label
         phone_source = getattr(session, "phone", None)
         if not phone_source and isinstance(metadata, Mapping):
             phone_source = metadata.get("phone")
         phone_label = _normalize_phone_label(phone_source)
-        if phone_label:
-            return phone_label
-        return "Аккаунт без данных"
+        base_label = phone_label or "Аккаунт без данных"
+        if not getattr(session, "is_active", True):
+            return f"{base_label} (неактивен)"
+        return base_label
 
     def _deduplicate_preserve_order(values: Sequence[str]) -> List[str]:
         seen: set[str] = set()

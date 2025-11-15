@@ -443,7 +443,10 @@ def setup_group_commands(client, context: BotContext) -> None:
 
     async def _get_active_sessions(user_id: int) -> Optional[List[TelethonSession]]:
         try:
-            sessions_iter = await context.session_manager.get_active_sessions(user_id)
+            sessions_iter = await context.session_manager.get_active_sessions(
+                user_id,
+                verify_live=True,
+            )
         except Exception:
             logger.exception(
                 "Не удалось получить список активных аккаунтов",

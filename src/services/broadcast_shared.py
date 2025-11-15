@@ -16,6 +16,21 @@ from telethon.errors.rpcerrorlist import ChatWriteForbiddenError, FileReferenceE
 logger = logging.getLogger(__name__)
 
 
+class DialogsFetchError(RuntimeError):
+    """Raised when dialogs cannot be fetched for a given account."""
+
+    def __init__(self, account_session_id: str, *, account_label: str, original_error: Exception) -> None:
+        self.account_session_id = account_session_id
+        self.account_label = account_label
+        self.original_error = original_error
+        self.error_type = original_error.__class__.__name__
+        message = (
+            f"Failed to fetch dialogs for account {account_label}"
+            f" ({account_session_id}): {original_error}"
+        )
+        super().__init__(message)
+
+
 def sanitize_username_value(value: object) -> Optional[str]:
     if value is None:
         return None
@@ -244,7 +259,11 @@ async def resolve_group_targets(
                     error=str(exc),
                     **base_context,
                 )
-                dialogs = []
+                raise DialogsFetchError(
+                    account_session_id,
+                    account_label=account_label,
+                    original_error=exc,
+                ) from exc
             else:
                 dialogs_store[account_session_id] = dialogs
         matches: list[object] = []
@@ -533,6 +552,7 @@ _extract_identifier_from_link_value = extract_identifier_from_link_value
 __all__ = [
     "BroadcastImageData",
     "ResolvedGroupTarget",
+    "DialogsFetchError",
     "sanitize_username_value",
     "describe_content_payload",
     "extract_identifier_from_link_value",

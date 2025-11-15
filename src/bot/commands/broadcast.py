@@ -7,12 +7,18 @@ import logging
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence, Set
 
 from telethon import Button, events
 from telethon.events import NewMessage
 from telethon.tl import types as tl_types
 from telethon.errors import MessageNotModifiedError
+from telethon.errors.rpcerrorlist import (
+	AuthKeyUnregisteredError,
+	SessionRevokedError,
+	UserDeactivatedError,
+	UserDeactivatedBanError,
+)
 
 from src.bot.context import BotContext
 from src.bot.keyboards import (
@@ -34,6 +40,7 @@ from src.services.broadcast_state import (
 )
 from src.services.broadcast_shared import (
 	BroadcastImageData as SharedBroadcastImageData,
+	DialogsFetchError,
 	ResolvedGroupTarget as SharedResolvedGroupTarget,
 	describe_content_payload,
 	extract_group_log_context,
@@ -77,6 +84,14 @@ BROADCAST_BATCH_PAUSE_SECONDS = 10
 
 
 logger = logging.getLogger(__name__)
+
+AUTH_ERROR_TYPES = (
+	AuthKeyUnregisteredError,
+	SessionRevokedError,
+	UserDeactivatedError,
+	UserDeactivatedBanError,
+)
+AUTH_ERROR_NAMES = {error.__name__ for error in AUTH_ERROR_TYPES}
 
 
 def _log_broadcast(level: int, message: str, **details: Any) -> None:
@@ -579,7 +594,11 @@ async def _build_broadcast_plan(
 	plans: list[SessionBroadcastPlan] = []
 	errors: list[str] = []
 	total_groups = 0
+	seen_session_ids: set[str] = set()
 	for session_id in session_ids:
+		if not session_id or session_id in seen_session_ids:
+			continue
+		seen_session_ids.add(session_id)
 		session = stored_sessions.get(session_id)
 		if session is None:
 			try:
@@ -596,9 +615,25 @@ async def _build_broadcast_plan(
 		if session is None or session.owner_id != user_id:
 			errors.append("Выбранный аккаунт недоступен или был удалён.")
 			continue
-		if not session.is_active:
-			errors.append(f"Аккаунт {_render_session_label(session)} отключён. Активируйте его и повторите попытку.")
+		label = _render_session_label(session)
+		is_live = await context.session_manager.verify_session_status(session)
+		if not is_live:
+			await context.session_manager.deactivate_session(session.session_id)
+			await context.auto_broadcast_service.mark_account_inactive(
+				session.session_id,
+				owner_id=session.owner_id,
+				reason="session_validation_failed",
+				metadata=session.metadata,
+			)
+			errors.append(f"Аккаунт {label} стал неактивным, войдите снова.")
+			stored_sessions.pop(session.session_id, None)
 			continue
+		await context.auto_broadcast_service.mark_account_active(
+			session.session_id,
+			owner_id=session.owner_id,
+			metadata=session.metadata,
+		)
+		session.is_active = True
 
 		metadata = session.metadata or {}
 		all_groups = _extract_broadcast_groups(metadata)
@@ -751,6 +786,7 @@ async def _execute_broadcast_plan(
 	image_cache: dict[str, BroadcastImageData | None] = {}
 	dialogs_cache: dict[str, list[object]] = {}
 	status_message = "Рассылка запущена"
+	inactive_notified: Set[str] = set()
 
 	_log_broadcast(
 		logging.INFO,
@@ -784,6 +820,50 @@ async def _execute_broadcast_plan(
 			buttons=_build_progress_buttons(_is_cancelled()),
 		)
 
+	async def _handle_session_inactive(session: TelethonSession, detail: str) -> str:
+		session_id = session.session_id
+		session_label = _render_session_label(session)
+		display_label = session.display_name() or session_label
+		if session_id in inactive_notified:
+			return display_label
+		inactive_notified.add(session_id)
+		try:
+			await context.session_manager.deactivate_session(session_id)
+		except Exception:
+			logger.exception(
+				"Не удалось деактивировать аккаунт",
+				extra={"session_id": session_id, "owner_id": session.owner_id},
+			)
+		try:
+			await context.auto_broadcast_service.mark_account_inactive(
+				session_id,
+				owner_id=session.owner_id,
+				reason=detail,
+				metadata=session.metadata,
+			)
+		except Exception:
+			logger.exception(
+				"Не удалось обновить состояние аккаунта в базе",
+				extra={"session_id": session_id, "owner_id": session.owner_id},
+			)
+		session.is_active = False
+		_log_broadcast(
+			logging.WARNING,
+			"Аккаунт стал неактивен во время рассылки",
+			user_id=user_id,
+			account_label=display_label,
+			account_session_id=session_id,
+			detail=detail,
+		)
+		try:
+			await bot_client.send_message(user_id, f"Аккаунт {display_label} стал неактивным, войдите снова.")
+		except Exception:
+			logger.exception(
+				"Не удалось уведомить пользователя о неактивном аккаунте",
+				extra={"session_id": session_id, "owner_id": session.owner_id},
+			)
+		return display_label
+
 	try:
 		await _update_progress(status_message)
 
@@ -791,6 +871,7 @@ async def _execute_broadcast_plan(
 			if _is_cancelled():
 				break
 
+			session_inactive = False
 			current_account_label = _render_session_label(entry.session)
 			session_client = None
 			_log_broadcast(
@@ -805,7 +886,11 @@ async def _execute_broadcast_plan(
 
 			try:
 				session_client = await context.session_manager.build_client_from_session(entry.session)
-			except Exception:
+			except Exception as exc:
+				if isinstance(exc, AUTH_ERROR_TYPES):
+					label = await _handle_session_inactive(entry.session, f"build_client:{exc.__class__.__name__}")
+					await _update_progress(f"Аккаунт {label} стал неактивным, пропускаем")
+					session_inactive = True
 				logger.exception(
 					"Не удалось восстановить Telethon-клиент для аккаунта",
 					extra={"session_id": entry.session.session_id, "owner_id": entry.session.owner_id},
@@ -870,20 +955,39 @@ async def _execute_broadcast_plan(
 					continue
 
 				for group in entry.groups:
-					if _is_cancelled():
+					if session_inactive:
+						break
+					if _is_cancelled() or session_inactive:
 						break
 
 					current_chat_label = _render_group_label(group)
 					content_type = _describe_content_payload(bool(entry.text), session_image is not None)
-					targets, duplicates_message = await _resolve_group_targets(
-						session_client,
-						group,
-						user_id=user_id,
-						account_label=current_account_label,
-						account_session_id=entry.session.session_id,
-						content_type=content_type,
-						dialogs_cache=dialogs_cache,
-					)
+					try:
+						targets, duplicates_message = await _resolve_group_targets(
+							session_client,
+							group,
+							user_id=user_id,
+							account_label=current_account_label,
+							account_session_id=entry.session.session_id,
+							content_type=content_type,
+							dialogs_cache=dialogs_cache,
+						)
+					except DialogsFetchError as exc:
+						failed += 1
+						processed += 1
+						_log_broadcast(
+							logging.ERROR,
+							"Аккаунт утратил доступ к списку чатов",
+							user_id=user_id,
+							account_label=current_account_label,
+							account_session_id=entry.session.session_id,
+							reason=exc.error_type,
+							**_extract_group_log_context(group),
+						)
+						label = await _handle_session_inactive(entry.session, f"dialogs:{exc.error_type}")
+						session_inactive = True
+						await _update_progress(f"Аккаунт {label} стал неактивным, пропускаем")
+						break
 					if not targets:
 						failed += 1
 						processed += 1
@@ -904,6 +1008,8 @@ async def _execute_broadcast_plan(
 					duplicate_status_sent = False
 
 					for target in targets:
+						if session_inactive:
+							break
 						if _is_cancelled():
 							break
 
@@ -940,6 +1046,11 @@ async def _execute_broadcast_plan(
 								reason=reason,
 								**_extract_group_log_context(target.group),
 							)
+							if reason and reason in AUTH_ERROR_NAMES:
+								label = await _handle_session_inactive(entry.session, f"send:{reason}")
+								session_inactive = True
+								await _update_progress(f"Аккаунт {label} стал неактивным, пропускаем")
+								break
 							local_status = f"Ошибка: {reason or 'неизвестная ошибка'}"
 
 						status_for_progress = local_status
@@ -953,10 +1064,10 @@ async def _execute_broadcast_plan(
 
 						await _update_progress(status_for_progress)
 
-						if _is_cancelled():
+						if _is_cancelled() or session_inactive:
 							break
 
-						if processed < plan.total_groups and not _is_cancelled():
+						if processed < plan.total_groups and not (_is_cancelled() or session_inactive):
 							if processed % BROADCAST_BATCH_SIZE == 0:
 								await asyncio.sleep(BROADCAST_BATCH_PAUSE_SECONDS)
 							else:
@@ -1207,7 +1318,9 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 				extra={"user_id": user_id, "flow": previous_state.flow.value, "step": previous_state.step.value},
 			)
 
-		sessions = list(await context.session_manager.get_active_sessions(user_id))
+		sessions = list(
+			await context.session_manager.get_active_sessions(user_id, verify_live=True)
+		)
 		if not sessions:
 			await event.respond(config.no_sessions, buttons=build_main_menu_keyboard())
 			return
@@ -1273,7 +1386,10 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			run_manager.clear(user_id)
 
 		try:
-			sessions_iter = await context.session_manager.get_active_sessions(user_id)
+			sessions_iter = await context.session_manager.get_active_sessions(
+				user_id,
+				verify_live=True,
+			)
 		except Exception:
 			logger.exception("Не удалось получить список аккаунтов для рассылки", extra={"user_id": user_id})
 			await event.respond(
@@ -1582,7 +1698,10 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 				run_manager.clear(user_id)
 
 			try:
-				sessions_iter = await context.session_manager.get_active_sessions(user_id)
+				sessions_iter = await context.session_manager.get_active_sessions(
+					user_id,
+					verify_live=True,
+				)
 			except Exception:
 				logger.exception("Не удалось получить список аккаунтов для рассылки", extra={"user_id": user_id})
 				await event.respond(
@@ -1866,7 +1985,9 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			)
 
 		try:
-			sessions = list(await context.session_manager.get_active_sessions(user_id))
+			sessions = list(
+				await context.session_manager.get_active_sessions(user_id, verify_live=True)
+			)
 		except Exception:
 			logger.exception(
 				"Не удалось получить список аккаунтов для просмотра материалов",
@@ -1906,7 +2027,9 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			await event.answer("Некорректный выбор.", alert=True)
 			return
 
-		sessions = list(await context.session_manager.get_active_sessions(user_id))
+		sessions = list(
+			await context.session_manager.get_active_sessions(user_id, verify_live=True)
+		)
 		if not sessions:
 			await event.answer("Нет подключённых аккаунтов.", alert=True)
 			await event.edit(config.no_sessions, buttons=build_main_menu_keyboard())
@@ -2029,7 +2152,9 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			return
 
 		try:
-			sessions = list(await context.session_manager.get_active_sessions(user_id))
+			sessions = list(
+				await context.session_manager.get_active_sessions(user_id, verify_live=True)
+			)
 		except Exception:
 			logger.exception(
 				"Не удалось получить список аккаунтов для просмотра материалов",

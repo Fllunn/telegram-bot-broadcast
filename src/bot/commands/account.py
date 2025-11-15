@@ -76,7 +76,7 @@ def _build_logout_buttons(sessions: list[TelethonSession]) -> list[list[Button]]
     rows: list[list[Button]] = []
     for session in sessions:
         callback_data = f"logout_req:{session.session_id}".encode("utf-8")
-        label = f"Удалить {_render_account_target(session)}"
+        label = f"Отвязать {_render_account_target(session)}"
         rows.append([Button.inline(label, callback_data)])
     return rows
 
@@ -350,18 +350,63 @@ def setup_account_commands(client, context: BotContext) -> None:
         if not event.is_private:
             return
 
-        sessions = list(await context.session_manager.get_active_sessions(event.sender_id))
-        if not sessions:
+        active_sessions, inactive_sessions = await context.session_manager.refresh_owner_sessions(event.sender_id)
+
+        verified_active: list[TelethonSession] = []
+        verified_inactive: list[TelethonSession] = []
+
+        for session in inactive_sessions:
+            session.is_active = False
+            verified_inactive.append(session)
+            await context.auto_broadcast_service.mark_account_inactive(
+                session.session_id,
+                owner_id=session.owner_id,
+                reason="session_validation_failed",
+                metadata=session.metadata,
+            )
+
+        for session in active_sessions:
+            has_dialogs = await context.session_manager.ensure_dialog_access(session)
+            if has_dialogs:
+                session.is_active = True
+                verified_active.append(session)
+                await context.auto_broadcast_service.mark_account_active(
+                    session.session_id,
+                    owner_id=session.owner_id,
+                    metadata=session.metadata,
+                )
+            else:
+                session.is_active = False
+                verified_inactive.append(session)
+                await context.auto_broadcast_service.mark_account_inactive(
+                    session.session_id,
+                    owner_id=session.owner_id,
+                    reason="dialog_fetch_failed",
+                    metadata=session.metadata,
+                )
+
+        sessions_ordered: list[TelethonSession] = []
+        seen_ids: set[str] = set()
+        for session in verified_active + verified_inactive:
+            if session.session_id in seen_ids:
+                continue
+            seen_ids.add(session.session_id)
+            sessions_ordered.append(session)
+
+        if not sessions_ordered:
             await event.respond(
                 "У вас пока нет подключённых аккаунтов. Используйте /login_phone, чтобы подключить первый аккаунт.",
                 buttons=build_main_menu_keyboard(),
             )
             return
 
-        body = "\n".join(_format_session(session) for session in sessions)
+        body = "\n".join(_format_session(session) for session in sessions_ordered)
+        note = ""
+        if any(not session.is_active for session in sessions_ordered):
+            note = "\n\nНеактивные аккаунты требуют повторного входа через /login_phone или /login_qr."
         await event.respond(
-            f"Подключённые аккаунты:\n{body}\n\nНажмите кнопку, чтобы отключить аккаунт.",
-            buttons=_build_logout_buttons(sessions),
+            f"Подключённые аккаунты:\n{body}{note}\n\nНажмите кнопку, чтобы отвязать аккаунт.",
+            buttons=_build_logout_buttons(sessions_ordered),
         )
 
     @client.on(events.NewMessage(pattern=LOGIN_PHONE_PATTERN))
@@ -378,7 +423,9 @@ def setup_account_commands(client, context: BotContext) -> None:
             )
             return
 
-        existing_sessions = list(await context.session_manager.get_active_sessions(user_id))
+        existing_sessions = list(
+            await context.session_manager.get_active_sessions(user_id, verify_live=True)
+        )
         intro = ""
         if existing_sessions:
             body = "\n".join(_format_session(session) for session in existing_sessions)
@@ -404,7 +451,9 @@ def setup_account_commands(client, context: BotContext) -> None:
             )
             return
 
-        existing_sessions = list(await context.session_manager.get_active_sessions(user_id))
+        existing_sessions = list(
+            await context.session_manager.get_active_sessions(user_id, verify_live=True)
+        )
 
         temp_client: TelegramClient | None = None
         try:
@@ -681,7 +730,9 @@ def setup_account_commands(client, context: BotContext) -> None:
             return
 
         try:
-            sessions = list(await context.session_manager.get_active_sessions(user_id))
+            sessions = list(
+                await context.session_manager.get_active_sessions(user_id, verify_live=True)
+            )
             message = await _send_qr_via_client(client, user_id, state.qr_login, sessions or None)
         except Exception:
             logger.exception("Не удалось отправить новый QR-код", extra={"user_id": user_id})
@@ -735,7 +786,7 @@ def setup_account_commands(client, context: BotContext) -> None:
         target = _render_account_target(session)
 
         await event.edit(
-            f"Вы действительно хотите удалить аккаунт {target}?",
+            f"Вы действительно хотите отвязать аккаунт {target}?",
             buttons=[
                 [
                     Button.inline("✅ Да", f"logout_yes:{session.session_id}".encode("utf-8")),
@@ -763,7 +814,7 @@ def setup_account_commands(client, context: BotContext) -> None:
                 "Ошибка при удалении пользовательской сессии",
                 extra={"user_id": user_id, "session_id": session.session_id},
             )
-            await event.answer("Не удалось отключить аккаунт. Попробуйте позже.", alert=True)
+            await event.answer("Не удалось отвязать аккаунт. Попробуйте позже.", alert=True)
             return
 
         if not removed:
@@ -772,7 +823,9 @@ def setup_account_commands(client, context: BotContext) -> None:
 
         target = _render_account_target(session)
 
-        remaining = list(await context.session_manager.get_active_sessions(user_id))
+        remaining = list(
+            await context.session_manager.get_active_sessions(user_id, verify_live=True)
+        )
         if removed:
             await event.answer("Аккаунт отключён.")
 
@@ -787,7 +840,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             await event.edit(
                 (
                     f"{status_header}\n\nПодключённые аккаунты:\n{body}\n\n"
-                    "Чтобы отключить другой аккаунт, выберите его ниже."
+                    "Чтобы отвязать другой аккаунт, выберите его ниже."
                 ),
                 buttons=_build_logout_buttons(remaining),
             )
@@ -804,13 +857,15 @@ def setup_account_commands(client, context: BotContext) -> None:
             await event.answer("Некорректный запрос.", alert=True)
             return
         # Even if session is missing (e.g. removed elsewhere), fall back to fresh list.
-        remaining = list(await context.session_manager.get_active_sessions(user_id))
+        remaining = list(
+            await context.session_manager.get_active_sessions(user_id, verify_live=True)
+        )
         await event.answer("Удаление отменено.")
 
         if remaining:
             body = "\n".join(_format_session(item) for item in remaining)
             await event.edit(
-                f"Подключённые аккаунты:\n{body}\n\nНажмите кнопку, чтобы отключить аккаунт.",
+                f"Подключённые аккаунты:\n{body}\n\nНажмите кнопку, чтобы отвязать аккаунт.",
                 buttons=_build_logout_buttons(remaining),
             )
         else:

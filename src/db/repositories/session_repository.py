@@ -77,6 +77,34 @@ class SessionRepository:
             sessions.append(TelethonSession.model_validate(normalized))
         return sessions
 
+    async def list_sessions_for_owner(
+        self,
+        owner_id: int,
+        owner_type: SessionOwnerType = SessionOwnerType.USER,
+    ) -> list[TelethonSession]:
+        cursor = self._collection.find({"owner_id": owner_id, "owner_type": owner_type.value})
+        sessions: list[TelethonSession] = []
+        async for document in cursor:
+            normalized = self._normalize_document(document)
+            sessions.append(TelethonSession.model_validate(normalized))
+        return sessions
+
+    async def set_session_active(self, session_id: str, is_active: bool) -> Optional[TelethonSession]:
+        document = await self._collection.find_one_and_update(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "is_active": bool(is_active),
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is None:
+            return None
+        normalized = self._normalize_document(document)
+        return TelethonSession.model_validate(normalized)
+
     async def delete_session(self, session_id: str) -> bool:
         result = await self._collection.delete_one({"session_id": session_id})
         return result.deleted_count > 0

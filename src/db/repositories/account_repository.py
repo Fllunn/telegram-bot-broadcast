@@ -142,12 +142,28 @@ class AccountRepository:
         )
         return self._deserialize(document)
 
+    async def mark_inactive(self, account_id: str, *, reason: Optional[str] = None) -> Optional[AccountState]:
+        document = await self._collection.find_one_and_update(
+            {"account_id": account_id},
+            {
+                "$set": {
+                    "status": AccountStatus.INACTIVE.value,
+                    "cooldown_until": None,
+                    "blocked_reason": reason,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return self._deserialize(document)
+
     async def mark_active(self, account_id: str) -> Optional[AccountState]:
         document = await self._collection.find_one_and_update(
             {"account_id": account_id},
             {
                 "$set": {
                     "status": AccountStatus.ACTIVE.value,
+                    "cooldown_until": None,
                     "blocked_reason": None,
                     "updated_at": datetime.utcnow(),
                 }
@@ -169,7 +185,8 @@ class AccountRepository:
             {"account_id": {"$nin": ids}, "owner_id": owner_id},
             {
                 "$set": {
-                    "status": AccountStatus.BLOCKED.value,
+                    "status": AccountStatus.INACTIVE.value,
+                    "cooldown_until": None,
                     "blocked_reason": "account missing from session repository",
                     "updated_at": now,
                 }
@@ -180,6 +197,8 @@ class AccountRepository:
             {
                 "$set": {
                     "status": AccountStatus.ACTIVE.value,
+                    "cooldown_until": None,
+                    "blocked_reason": None,
                     "updated_at": now,
                 }
             },
