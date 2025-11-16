@@ -43,6 +43,8 @@ from src.services.broadcast_shared import (
 	BroadcastImageData as SharedBroadcastImageData,
 	DialogsFetchError,
 	ResolvedGroupTarget as SharedResolvedGroupTarget,
+	deduplicate_broadcast_groups,
+	collect_unique_target_peer_keys,
 	describe_content_payload,
 	extract_group_log_context,
 	extract_identifier_from_link_value,
@@ -183,8 +185,10 @@ class SessionBroadcastPlan:
 
 	session: TelethonSession
 	groups: list[Mapping[str, object]]
-	text: Optional[str]
-	image_meta: Optional[Mapping[str, object]]
+	text: Optional[str] = None
+	image_meta: Optional[Mapping[str, object]] = None
+	rows_total: int = 0
+	actual_target_count: int = 0
 
 	def has_text(self) -> bool:
 		return bool(self.text and self.text.strip())
@@ -203,6 +207,8 @@ class BroadcastPlan:
 
 	sessions: list[SessionBroadcastPlan]
 	total_groups: int
+	unique_groups_total: int
+	rows_total: int
 
 	def has_text(self) -> bool:
 		return any(entry.has_text() for entry in self.sessions)
@@ -230,6 +236,50 @@ def _extract_payload(data: bytes, prefix: str) -> str | None:
 	if not decoded.startswith(prefix):
 		return None
 	return decoded.split(":", maxsplit=1)[-1]
+
+
+def _coerce_positive_int(value: object, *, default: int = 0) -> int:
+	if value is None or isinstance(value, bool):
+		return default
+	try:
+		number = int(value)
+	except (TypeError, ValueError):
+		return default
+	return number if number > 0 else default
+
+
+async def _calculate_actual_target_count(
+	context: BotContext,
+	session: TelethonSession,
+	groups: Sequence[Mapping[str, object]],
+	*,
+	user_id: int,
+	account_label: str,
+	content_type: Optional[str],
+) -> int:
+	if not groups:
+		return 0
+	session_client = None
+	try:
+		session_client = await context.session_manager.build_client_from_session(session)
+		peer_keys = await collect_unique_target_peer_keys(
+			session_client,
+			groups,
+			user_id=user_id,
+			account_label=account_label,
+			account_session_id=session.session_id,
+			content_type=content_type,
+		)
+		return len(peer_keys)
+	finally:
+		if session_client is not None:
+			try:
+				await context.session_manager.close_client(session_client)
+			except Exception:
+				logger.exception(
+					"Не удалось закрыть клиент Telethon после расчёта целевых групп",
+					extra={"session_id": session.session_id},
+				)
 
 
 def _expect_step(context: BotContext, step: BroadcastStep):
@@ -460,7 +510,11 @@ def _format_duration(seconds: float) -> str:
 
 
 def _build_confirmation_text(plan: BroadcastPlan) -> str:
-	lines = [f"Будет отправлено: {plan.total_groups} групп."]
+	lines = [f"Будет отправлено в {plan.total_groups} уникальные группы."]
+	if plan.rows_total:
+		lines.append(f"Строк в файлах: {plan.rows_total}.")
+	if plan.unique_groups_total and plan.unique_groups_total != plan.total_groups:
+		lines.append(f"Уникальных записей в списке: {plan.unique_groups_total}.")
 	if len(plan.sessions) == 1:
 		lines.append(f"Выбранный аккаунт: {plan.session_labels()[0]}.")
 	else:
@@ -552,7 +606,7 @@ async def _resolve_group_targets(
 
 async def _prepare_image_data(plan_entry: SessionBroadcastPlan) -> BroadcastImageData | None:
 	image_meta = plan_entry.image_meta
-	if not image_meta:
+	if not image_meta or not isinstance(image_meta, Mapping):
 		return None
 	raw_bytes: Optional[bytes] = None
 	encoded = image_meta.get("data_b64")
@@ -596,7 +650,9 @@ async def _build_broadcast_plan(
 ) -> tuple[BroadcastPlan | None, list[str]]:
 	plans: list[SessionBroadcastPlan] = []
 	errors: list[str] = []
-	total_groups = 0
+	unique_groups_total = 0
+	rows_total = 0
+	actual_groups_total = 0
 	seen_session_ids: set[str] = set()
 	session_candidates: list[TelethonSession] = []
 	session_labels: dict[str, str] = {}
@@ -655,6 +711,7 @@ async def _build_broadcast_plan(
 			metadata=session.metadata,
 		)
 		session.is_active = True
+		account_label = _render_session_label(session)
 
 		metadata = session.metadata or {}
 		all_groups = _extract_broadcast_groups(metadata)
@@ -662,7 +719,7 @@ async def _build_broadcast_plan(
 			logging.INFO,
 			f"Загружено {len(all_groups)} групп для аккаунта",
 			user_id=user_id,
-			account_label=_render_session_label(session),
+			account_label=account_label,
 			account_session_id=session.session_id,
 		)
 		valid_groups: list[Mapping[str, object]] = []
@@ -682,16 +739,19 @@ async def _build_broadcast_plan(
 				)
 				continue
 			valid_groups.append(dict(group))
-		_log_broadcast(
-			logging.INFO,
-			f"Подготовлено {len(valid_groups)} доступных чатов для аккаунта",
-			user_id=user_id,
-			account_label=_render_session_label(session),
-			account_session_id=session.session_id,
-			groups_total=len(all_groups),
-			groups_available=len(valid_groups),
-		)
-
+		unique_groups = deduplicate_broadcast_groups(valid_groups)
+		stats_payload = metadata.get("broadcast_groups_stats") if isinstance(metadata, Mapping) else None
+		rows_from_stats = _coerce_positive_int(stats_payload.get("file_rows"), default=0) if isinstance(stats_payload, Mapping) else 0
+		unique_from_stats = _coerce_positive_int(stats_payload.get("unique_groups"), default=0) if isinstance(stats_payload, Mapping) else 0
+		rows_from_occurrences = 0
+		for unique_entry in unique_groups:
+			source_occurrences = _coerce_positive_int(unique_entry.get("source_occurrences"), default=1)
+			if source_occurrences <= 0:
+				source_occurrences = 1
+			unique_entry["source_occurrences"] = source_occurrences
+			rows_from_occurrences += source_occurrences
+		rows_for_account = rows_from_stats or rows_from_occurrences or len(valid_groups)
+		unique_for_account = unique_from_stats or len(unique_groups)
 		raw_text = metadata.get("broadcast_text") if isinstance(metadata, Mapping) else None
 		text = None
 		if isinstance(raw_text, str):
@@ -704,18 +764,52 @@ async def _build_broadcast_plan(
 				logging.WARNING,
 				"Сохранённая картинка устарела и будет пропущена",
 				user_id=user_id,
-				account_label=_render_session_label(session),
+				account_label=account_label,
 				account_session_id=session.session_id,
 			)
 			image_meta = None
+		content_type = _describe_content_payload(bool(text), bool(image_meta))
 
 		session_errors: list[str] = []
-		if not valid_groups:
-			session_errors.append(f"Для аккаунта {_render_session_label(session)} не найден доступный список групп.")
+		if not unique_groups:
+			session_errors.append(f"Для аккаунта {account_label} не найден доступный список групп.")
 		if not (text or image_meta):
 			session_errors.append(
-				f"Для аккаунта {_render_session_label(session)} нет текста или картинки для рассылки. Добавьте материалы через /add_text или /add_image."
+				f"Для аккаунта {account_label} нет текста или картинки для рассылки. Добавьте материалы через /add_text или /add_image."
 			)
+		stats_actual_default = _coerce_positive_int(
+			stats_payload.get("actual_targets") if isinstance(stats_payload, Mapping) else None,
+			default=len(unique_groups),
+		)
+		actual_target_count = stats_actual_default
+		if not session_errors and unique_groups:
+			try:
+				actual_target_count = await _calculate_actual_target_count(
+					context,
+					session,
+					unique_groups,
+					user_id=user_id,
+					account_label=account_label,
+					content_type=content_type,
+				)
+			except DialogsFetchError as exc:
+				session_errors.append(
+					f"Не удалось проверить список чатов для аккаунта {account_label}. Попробуйте позже."
+				)
+				_log_broadcast(
+					logging.ERROR,
+					"Не удалось проверить список чатов для аккаунта",
+					user_id=user_id,
+					account_label=account_label,
+					account_session_id=session.session_id,
+					reason=exc.error_type,
+				)
+			except Exception:
+				logger.exception(
+					"Не удалось рассчитать фактическое количество целевых чатов",
+					extra={"session_id": session.session_id, "user_id": user_id},
+				)
+				actual_target_count = max(actual_target_count, len(unique_groups))
 		if session_errors:
 			errors.extend(session_errors)
 			if skipped_group_labels:
@@ -726,25 +820,53 @@ async def _build_broadcast_plan(
 				logging.WARNING,
 				"Аккаунт пропущен из-за ошибок подготовки рассылки",
 				user_id=user_id,
-				account_label=_render_session_label(session),
+				account_label=account_label,
 				account_session_id=session.session_id,
 				issues=session_errors,
 				skipped_groups=skipped_group_labels,
 			)
 			continue
 
+		_log_broadcast(
+			logging.INFO,
+			f"Подготовлено {actual_target_count} целевых чатов для аккаунта",
+			user_id=user_id,
+			account_label=account_label,
+			account_session_id=session.session_id,
+			groups_total=len(all_groups),
+			groups_available=len(valid_groups),
+			groups_unique=len(unique_groups),
+			groups_actual=actual_target_count,
+			file_rows=rows_for_account,
+			file_unique=unique_for_account,
+			rows_available=rows_from_occurrences,
+		)
+
 		plan_entry = SessionBroadcastPlan(
 			session=session,
-			groups=valid_groups,
+			groups=unique_groups,
 			text=text,
 			image_meta=image_meta,
+			rows_total=rows_for_account,
+			actual_target_count=actual_target_count,
 		)
 		plans.append(plan_entry)
-		total_groups += len(valid_groups)
+		unique_groups_total += len(unique_groups)
+		rows_total += rows_for_account
+		actual_groups_total += actual_target_count
 
-	if plans and total_groups <= 0:
+	if plans and actual_groups_total <= 0:
 		errors.append("Не удалось определить группы для рассылки. Загрузите их через /upload_groups.")
-	plan = BroadcastPlan(sessions=plans, total_groups=total_groups) if plans and total_groups > 0 else None
+	plan = (
+		BroadcastPlan(
+			sessions=plans,
+			total_groups=actual_groups_total,
+			unique_groups_total=unique_groups_total,
+			rows_total=rows_total,
+		)
+		if plans and actual_groups_total > 0
+		else None
+	)
 	return plan, errors
 
 
@@ -814,6 +936,8 @@ async def _execute_broadcast_plan(
 		"Рассылка запущена",
 		user_id=user_id,
 		total_groups=plan.total_groups,
+		unique_groups=plan.unique_groups_total,
+		file_rows=plan.rows_total,
 		accounts=len(plan.sessions),
 	)
 
@@ -901,7 +1025,9 @@ async def _execute_broadcast_plan(
 				user_id=user_id,
 				account_label=current_account_label,
 				account_session_id=entry.session.session_id,
-				groups_total=len(entry.groups),
+				groups_total=entry.actual_target_count,
+				groups_unique=len(entry.groups),
+				file_rows=entry.rows_total,
 				content_type=_describe_content_payload(bool(entry.text), entry.has_image()),
 			)
 
@@ -1056,9 +1182,6 @@ async def _execute_broadcast_plan(
 						await _update_progress("Не удалось определить чат, пропускаем")
 						continue
 
-					if len(targets) > 1:
-						plan.total_groups += len(targets) - 1
-
 					duplicate_status_sent = False
 
 					for target in targets:
@@ -1145,14 +1268,21 @@ async def _execute_broadcast_plan(
 						)
 
 		final_status = "Рассылка остановлена пользователем" if _is_cancelled() else "Рассылка завершена"
-		summary_lines = [final_status, f"Отправлено успешно: {success}"]
+		summary_lines = [final_status, f"Успешно: {success}"]
 		if failed:
 			summary_lines.append(f"С ошибками: {failed}")
+		summary_lines.append(f"Целевых чатов: {plan.total_groups}")
+		if plan.unique_groups_total and plan.unique_groups_total != plan.total_groups:
+			summary_lines.append(f"Уникальных записей в списке: {plan.unique_groups_total}")
+		if plan.rows_total:
+			summary_lines.append(f"Строк в файлах: {plan.rows_total}")
 		_log_broadcast(
 			logging.INFO,
 			"Рассылка завершена",
 			user_id=user_id,
 			total_groups=plan.total_groups,
+			unique_groups=plan.unique_groups_total,
+			file_rows=plan.rows_total,
 			success=success,
 			failed=failed,
 			cancelled=_is_cancelled(),

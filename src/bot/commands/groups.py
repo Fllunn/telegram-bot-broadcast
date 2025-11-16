@@ -18,6 +18,11 @@ from telethon.tl.types import DocumentAttributeFilename
 from src.bot.context import BotContext
 from src.bot.keyboards import UPLOAD_GROUPS_LABEL, VIEW_GROUPS_LABEL, build_main_menu_keyboard
 from src.models.session import TelethonSession
+from src.services.broadcast_shared import (
+    DialogsFetchError,
+    collect_unique_target_peer_keys,
+    deduplicate_broadcast_groups,
+)
 from src.services.groups_state import (
     GroupUploadScope,
     GroupUploadStateManager,
@@ -50,6 +55,10 @@ VIEW_CANCEL_PREFIX = "view_groups_cancel"
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 PAGE_SIZE = 10
 PAYLOAD_VERSION = "v2"
+DEDUP_NOTICE = (
+    "Группы будут обработаны один раз для каждой уникальной группы на аккаунте. "
+    "Количество строк в файле может отличаться от количества фактических рассылок."
+)
 
 
 @dataclass(frozen=True)
@@ -983,7 +992,7 @@ def setup_group_commands(client, context: BotContext) -> None:
                 return
             sanitized_ids: list[str] = []
             for session_id in target_ids:
-                state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=False)
+                state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=True)
                 if snapshot is None:
                     logger.warning(
                         "Целевой аккаунт недоступен при загрузке файла",
@@ -995,29 +1004,102 @@ def setup_group_commands(client, context: BotContext) -> None:
                 resolved_snapshots.append(snapshot)
             target_ids = sanitized_ids
 
-        enriched_groups = []
+        enriched_groups: list[dict[str, object]] = []
         for group in parsed_groups:
             chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
             enriched_groups.append(_serialize_group(group, chat_id, is_member))
 
-            operation_scope = state.scope
+        unique_groups = deduplicate_broadcast_groups(enriched_groups)
+        groups_stats = {
+            "file_rows": len(enriched_groups),
+            "unique_groups": len(unique_groups),
+        }
+        account_stats: dict[str, dict[str, object]] = {}
+        for snapshot in resolved_snapshots:
+            stats_for_account = dict(groups_stats)
+            session_obj = snapshot.cached_session
+            if session_obj is None:
+                try:
+                    session_obj = await context.session_repository.get_by_session_id(snapshot.session_id)
+                except Exception:
+                    logger.exception(
+                        "Не удалось загрузить данные аккаунта при расчёте групп",
+                        extra={"user_id": user_id, "session_id": snapshot.session_id},
+                    )
+                    session_obj = None
+                else:
+                    snapshot.cached_session = session_obj
+            actual_targets = len(unique_groups)
+            if session_obj is not None and unique_groups:
+                session_client = None
+                try:
+                    session_client = await context.session_manager.build_client_from_session(session_obj)
+                    peer_keys = await collect_unique_target_peer_keys(
+                        session_client,
+                        unique_groups,
+                        user_id=user_id,
+                        account_label=snapshot.label,
+                        account_session_id=session_obj.session_id,
+                    )
+                    actual_targets = len(peer_keys)
+                except DialogsFetchError as exc:
+                    logger.warning(
+                        "Не удалось проверить список чатов при загрузке групп",
+                        extra={"user_id": user_id, "session_id": snapshot.session_id, "reason": exc.error_type},
+                    )
+                except Exception:
+                    logger.exception(
+                        "Ошибка при расчёте фактических групп при загрузке",
+                        extra={"user_id": user_id, "session_id": snapshot.session_id},
+                    )
+                finally:
+                    if session_client is not None:
+                        try:
+                            await context.session_manager.close_client(session_client)
+                        except Exception:
+                            logger.exception(
+                                "Не удалось закрыть клиент после расчёта фактических групп",
+                                extra={"session_id": snapshot.session_id},
+                            )
+            stats_for_account["actual_targets"] = actual_targets
+            account_stats[snapshot.session_id] = stats_for_account
+        for session_id in target_ids:
+            if session_id not in account_stats:
+                stats_fallback = dict(groups_stats)
+                stats_fallback["actual_targets"] = len(unique_groups)
+                account_stats[session_id] = stats_fallback
+
+        snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
+        operation_scope = state.scope
         try:
             if operation_scope == GroupUploadScope.ALL:
-                updated = await context.session_repository.set_broadcast_groups_bulk(
-                    target_ids,
-                    enriched_groups,
-                    owner_id=user_id,
-                )
-                if updated == 0:
-                    raise RuntimeError("Не удалось обновить ни один аккаунт")
-                if updated < len(target_ids):
+                updated = 0
+                for session_id in target_ids:
+                    snapshot = snapshot_lookup.get(session_id)
+                    stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                    success = await context.session_repository.set_broadcast_groups(
+                        session_id,
+                        enriched_groups,
+                        owner_id=user_id,
+                        unique_groups=unique_groups,
+                        stats=stats_for_account,
+                    )
+                    if not success:
+                        label = snapshot.label if snapshot else session_id
+                        raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                    updated += 1
+                if updated != len(target_ids):
                     raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
                 upload_manager.reset_targets(user_id)
             else:
+                session_id = target_ids[0]
+                stats_for_account = account_stats.get(session_id, dict(groups_stats))
                 success = await context.session_repository.set_broadcast_groups(
-                    target_ids[0],
+                    session_id,
                     enriched_groups,
                     owner_id=user_id,
+                    unique_groups=unique_groups,
+                    stats=stats_for_account,
                 )
                 if not success:
                     raise RuntimeError("Не удалось обновить выбранный аккаунт")
@@ -1040,11 +1122,22 @@ def setup_group_commands(client, context: BotContext) -> None:
             label = snapshot.label if snapshot else "выбранного аккаунта"
             success_text = f"Список групп для аккаунта {label} успешно обновлён."
 
+        success_text = f"{success_text}\n\n{DEDUP_NOTICE}"
+
+        total_actual_targets = 0
+        for stats_payload in account_stats.values():
+            value = stats_payload.get("actual_targets")
+            try:
+                total_actual_targets += int(value)
+            except (TypeError, ValueError):
+                total_actual_targets += len(unique_groups)
         logger.info(
-            "Пользователь %s загрузил список групп (scope=%s, count=%s)",
+            "Пользователь %s загрузил список групп (scope=%s, rows=%s, unique=%s, actual=%s)",
             user_id,
             state.scope.value,
             len(enriched_groups),
+            len(unique_groups),
+            total_actual_targets,
         )
 
         upload_manager.neutralize(user_id)

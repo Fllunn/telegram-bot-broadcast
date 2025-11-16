@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo import ReturnDocument
@@ -191,14 +191,32 @@ class SessionRepository:
         )
         return result.matched_count or 0
 
-    async def set_broadcast_groups(self, session_id: str, groups: Sequence[dict[str, Any]], *, owner_id: int) -> bool:
+    async def set_broadcast_groups(
+        self,
+        session_id: str,
+        groups: Sequence[dict[str, Any]],
+        *,
+        owner_id: int,
+        unique_groups: Optional[Sequence[dict[str, Any]]] = None,
+        stats: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
         if not session_id:
             return False
+        unique_payload = list(unique_groups) if unique_groups is not None else []
+        stats_payload = dict(stats or {})
+        stats_payload.setdefault("file_rows", len(groups))
+        stats_payload.setdefault("unique_groups", len(unique_payload) if unique_payload else len(groups))
+        stats_payload.setdefault(
+            "actual_targets",
+            stats_payload.get("unique_groups") if isinstance(stats_payload.get("unique_groups"), int) else (len(unique_payload) if unique_payload else len(groups)),
+        )
         update = await self._collection.update_one(
             {"session_id": session_id, "owner_id": owner_id},
             {
                 "$set": {
                     "metadata.broadcast_groups": list(groups),
+                    "metadata.broadcast_groups_unique": unique_payload,
+                    "metadata.broadcast_groups_stats": stats_payload,
                     "updated_at": datetime.utcnow(),
                 }
             },
@@ -211,15 +229,27 @@ class SessionRepository:
         groups: Sequence[dict[str, Any]],
         *,
         owner_id: int,
+        unique_groups: Optional[Sequence[dict[str, Any]]] = None,
+        stats: Optional[Mapping[str, Any]] = None,
     ) -> int:
         ids = [session_id for session_id in session_ids if session_id]
         if not ids:
             return 0
+        unique_payload = list(unique_groups) if unique_groups is not None else []
+        stats_payload = dict(stats or {})
+        stats_payload.setdefault("file_rows", len(groups))
+        stats_payload.setdefault("unique_groups", len(unique_payload) if unique_payload else len(groups))
+        stats_payload.setdefault(
+            "actual_targets",
+            stats_payload.get("unique_groups") if isinstance(stats_payload.get("unique_groups"), int) else (len(unique_payload) if unique_payload else len(groups)),
+        )
         result = await self._collection.update_many(
             {"session_id": {"$in": ids}, "owner_id": owner_id},
             {
                 "$set": {
                     "metadata.broadcast_groups": list(groups),
+                    "metadata.broadcast_groups_unique": unique_payload,
+                    "metadata.broadcast_groups_stats": stats_payload,
                     "updated_at": datetime.utcnow(),
                 }
             },

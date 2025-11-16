@@ -6,9 +6,10 @@ import mimetypes
 from dataclasses import dataclass
 from functools import partial
 from io import BytesIO
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
+from telethon import utils
 from telethon.errors import FloodWaitError, RPCError
 from telethon.errors.rpcerrorlist import ChatWriteForbiddenError, FileReferenceExpiredError, MediaEmptyError
 
@@ -86,6 +87,97 @@ def extract_group_log_context(group: Mapping[str, object]) -> dict[str, Any]:
     }
 
 
+def _normalize_chat_id_value(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        string = str(value).strip()
+    except Exception:
+        return None
+    if not string:
+        return None
+    if string.endswith(".0"):
+        string = string[:-2]
+    try:
+        return int(string)
+    except (TypeError, ValueError):
+        return None
+
+
+def _group_identity_tuple(group: Mapping[str, object]) -> Tuple[str, object]:
+    chat_id = _normalize_chat_id_value(group.get("chat_id"))
+    if chat_id is not None:
+        return ("id", chat_id)
+
+    username = sanitize_username_value(group.get("username"))
+    if username:
+        return ("username", username.casefold())
+
+    link_identifier = extract_identifier_from_link_value(group.get("link"))
+    if link_identifier:
+        return ("link", link_identifier.casefold())
+
+    raw_link = group.get("link")
+    if isinstance(raw_link, str) and raw_link.strip():
+        return ("raw_link", raw_link.strip().casefold())
+
+    name_value = group.get("name")
+    if isinstance(name_value, str) and name_value.strip():
+        return ("name", name_value.strip().casefold())
+
+    fallback: List[Tuple[str, str]] = []
+    for key, value in group.items():
+        try:
+            string_key = str(key)
+        except Exception:
+            string_key = repr(key)
+        try:
+            string_value = str(value)
+        except Exception:
+            string_value = repr(value)
+        fallback.append((string_key, string_value))
+    fallback.sort()
+    return ("fallback", tuple(fallback))
+
+
+def deduplicate_broadcast_groups(groups: Sequence[Mapping[str, object]]) -> List[dict[str, Any]]:
+    if not groups:
+        return []
+    unique: Dict[Tuple[str, object], dict[str, Any]] = {}
+    order: List[Tuple[str, object]] = []
+    for entry in groups:
+        if not isinstance(entry, Mapping):
+            continue
+        identity = _group_identity_tuple(entry)
+        payload = dict(entry)
+        occurrences_raw = payload.get("source_occurrences")
+        try:
+            initial_occurrences = int(occurrences_raw) if occurrences_raw is not None else 1
+        except (TypeError, ValueError):
+            initial_occurrences = 1
+        if identity not in unique:
+            payload_copy = dict(payload)
+            payload_copy["source_occurrences"] = max(1, initial_occurrences)
+            unique[identity] = payload_copy
+            order.append(identity)
+        else:
+            stored = unique[identity]
+            stored_occurrences = stored.get("source_occurrences", 1)
+            try:
+                stored_count = int(stored_occurrences)
+            except (TypeError, ValueError):
+                stored_count = 1
+            stored["source_occurrences"] = stored_count + max(1, initial_occurrences)
+            for key, value in payload.items():
+                if key not in stored:
+                    stored[key] = value
+    return [unique[key] for key in order]
+
+
 @dataclass(slots=True)
 class BroadcastImageData:
     """Prepared input media reference for broadcasting images."""
@@ -105,6 +197,62 @@ class ResolvedGroupTarget:
     group: Mapping[str, object]
     label: str
     log_context: dict[str, Any]
+
+
+def _resolved_target_identity(target: ResolvedGroupTarget) -> tuple[str, object | tuple]:
+    try:
+        peer_id = utils.get_peer_id(target.entity)
+    except Exception:
+        peer_id = None
+    if peer_id is not None:
+        return ("peer", int(peer_id))
+    match_chat_id = target.log_context.get("match_chat_id")
+    if match_chat_id is not None:
+        return ("match_chat_id", match_chat_id)
+    match_username = target.log_context.get("match_username")
+    if match_username:
+        username = str(match_username).strip().lstrip("@")
+        if username:
+            return ("match_username", username.casefold())
+    group_chat_id = target.group.get("chat_id") if isinstance(target.group, Mapping) else None
+    if isinstance(group_chat_id, int):
+        return ("group_chat_id", group_chat_id)
+    group_username = sanitize_username_value(target.group.get("username")) if isinstance(target.group, Mapping) else None
+    if group_username:
+        return ("group_username", group_username.casefold())
+    label = target.label.strip().casefold() if isinstance(target.label, str) else repr(target.label)
+    return ("label", label)
+
+
+async def collect_unique_target_peer_keys(
+    client,
+    groups: Sequence[Mapping[str, object]],
+    *,
+    user_id: int,
+    account_label: str,
+    account_session_id: str,
+    content_type: Optional[str] = None,
+    dialogs_cache: Optional[dict[str, list[object]]] = None,
+) -> Set[tuple[str, object | tuple]]:
+    if not groups:
+        return set()
+    dialogs_store = dialogs_cache if dialogs_cache is not None else {}
+    peer_keys: Set[tuple[str, object | tuple]] = set()
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        targets, _ = await resolve_group_targets(
+            client,
+            group,
+            user_id=user_id,
+            account_label=account_label,
+            account_session_id=account_session_id,
+            content_type=content_type,
+            dialogs_cache=dialogs_store,
+        )
+        for target in targets:
+            peer_keys.add(_resolved_target_identity(target))
+    return peer_keys
 
 
 def log_broadcast_event(level: int, message: str, **details: Any) -> None:
@@ -560,6 +708,8 @@ __all__ = [
     "resolve_group_targets",
     "send_payload_to_group",
     "log_broadcast_event",
+    "deduplicate_broadcast_groups",
+    "collect_unique_target_peer_keys",
     "_log_broadcast",
     "_render_group_label",
     "_extract_group_log_context",
