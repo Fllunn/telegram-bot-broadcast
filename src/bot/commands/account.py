@@ -12,6 +12,7 @@ from telethon import Button, TelegramClient, events
 from telethon.tl.custom.message import Message
 from telethon.events import NewMessage
 from telethon.errors import (
+    MessageNotModifiedError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -468,6 +469,8 @@ def setup_account_commands(client, context: BotContext) -> None:
                     text,
                     buttons=_build_logout_buttons(sessions_ordered),
                 )
+            except MessageNotModifiedError:
+                logger.debug("Account status message unchanged", extra={"user_id": user_id})
             except Exception:
                 logger.exception("Failed to edit account status message", extra={"user_id": user_id})
 

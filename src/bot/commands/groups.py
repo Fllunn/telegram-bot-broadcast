@@ -26,6 +26,7 @@ from src.services.groups_state import (
     GroupViewScope,
     GroupViewStateManager,
     GroupViewStep,
+    UploadAccountSnapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ VIEW_CANCEL_PREFIX = "view_groups_cancel"
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xls"}
 PAGE_SIZE = 10
+PAYLOAD_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -130,39 +132,111 @@ def _render_session_label(session: TelethonSession) -> str:
     return f"{display} ({phone})" if phone else display
 
 
-def _build_upload_scope_buttons() -> list[list[Button]]:
+def _build_upload_snapshot(session: TelethonSession) -> UploadAccountSnapshot:
+    return UploadAccountSnapshot(
+        session_id=session.session_id,
+        owner_id=session.owner_id,
+        label=_render_session_label(session),
+        cached_session=session,
+    )
+
+
+def _prepare_upload_snapshots(sessions: Iterable[TelethonSession]) -> dict[str, UploadAccountSnapshot]:
+    snapshot_map: dict[str, UploadAccountSnapshot] = {}
+    for session in sessions:
+        snapshot = _build_upload_snapshot(session)
+        snapshot_map[snapshot.session_id] = snapshot
+    return snapshot_map
+
+
+def _touch_snapshot(snapshot: UploadAccountSnapshot, session: TelethonSession) -> UploadAccountSnapshot:
+    snapshot.cached_session = session
+    snapshot.owner_id = session.owner_id
+    snapshot.label = _render_session_label(session)
+    return snapshot
+
+
+def _join_session_identifier(parts: Sequence[str]) -> str:
+    return ":".join(part for part in parts if part).strip()
+
+
+def _build_upload_scope_buttons(flow_id: str) -> list[list[Button]]:
     return [
         [
-            Button.inline("Один аккаунт", f"{UPLOAD_SCOPE_PREFIX}:{UPLOAD_SCOPE_SINGLE}".encode("utf-8")),
-            Button.inline("Все аккаунты", f"{UPLOAD_SCOPE_PREFIX}:{UPLOAD_SCOPE_ALL}".encode("utf-8")),
+            Button.inline(
+                "Один аккаунт",
+                f"{UPLOAD_SCOPE_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_SINGLE}".encode("utf-8"),
+            ),
+            Button.inline(
+                "Все аккаунты",
+                f"{UPLOAD_SCOPE_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_ALL}".encode("utf-8"),
+            ),
         ],
-        [Button.inline("❌ Отмена", f"{CANCEL_PREFIX}:scope".encode("utf-8"))],
+        [
+            Button.inline(
+                "❌ Отмена",
+                f"{CANCEL_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:scope".encode("utf-8"),
+            )
+        ],
     ]
 
 
-def _build_upload_account_buttons(sessions: Iterable[TelethonSession]) -> list[list[Button]]:
+def _build_upload_account_buttons(flow_id: str, sessions: Iterable[UploadAccountSnapshot]) -> list[list[Button]]:
     rows: list[list[Button]] = []
     for session in sessions:
         rows.append(
             [
                 Button.inline(
-                    _render_session_label(session),
-                    f"{SELECT_PREFIX}:{session.session_id}".encode("utf-8"),
+                    session.label,
+                    f"{SELECT_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{session.session_id}".encode("utf-8"),
                 )
             ]
         )
-    rows.append([Button.inline("❌ Отмена", f"{CANCEL_PREFIX}:select".encode("utf-8"))])
+    rows.append(
+        [
+            Button.inline(
+                "❌ Отмена",
+                f"{CANCEL_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:select".encode("utf-8"),
+            )
+        ]
+    )
     return rows
 
 
-def _build_upload_confirmation_buttons(scope: GroupUploadScope, session_id: Optional[str] = None) -> list[list[Button]]:
-    if scope == GroupUploadScope.SINGLE and session_id:
-        yes_payload = f"{CONFIRM_PREFIX}:{UPLOAD_SCOPE_SINGLE}:yes:{session_id}".encode("utf-8")
-        no_payload = f"{CONFIRM_PREFIX}:{UPLOAD_SCOPE_SINGLE}:no:{session_id}".encode("utf-8")
+def _build_upload_confirmation_buttons(
+    flow_id: str,
+    scope: GroupUploadScope,
+    session_token: Optional[str] = None,
+) -> list[list[Button]]:
+    if scope == GroupUploadScope.SINGLE and session_token:
+        yes_payload = (
+            f"{CONFIRM_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_SINGLE}:yes:{session_token}".encode("utf-8")
+        )
+        no_payload = (
+            f"{CONFIRM_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_SINGLE}:no:{session_token}".encode("utf-8")
+        )
     else:
-        yes_payload = f"{CONFIRM_PREFIX}:{UPLOAD_SCOPE_ALL}:yes".encode("utf-8")
-        no_payload = f"{CONFIRM_PREFIX}:{UPLOAD_SCOPE_ALL}:no".encode("utf-8")
+        yes_payload = f"{CONFIRM_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_ALL}:yes".encode("utf-8")
+        no_payload = f"{CONFIRM_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_SCOPE_ALL}:no".encode("utf-8")
     return [[Button.inline("✅ Да", yes_payload), Button.inline("❌ Нет", no_payload)]]
+
+
+def _parse_callback_payload(data: bytes, prefix: str) -> Optional[tuple[Optional[str], list[str]]]:
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    parts = decoded.split(":")
+    if not parts or parts[0] != prefix:
+        return None
+
+    if len(parts) >= 3 and parts[1] == PAYLOAD_VERSION:
+        flow_id = parts[2]
+        remainder = parts[3:]
+        return flow_id, remainder
+
+    return None, parts[1:]
 
 
 def _build_file_prompt_buttons() -> list[list[Button]]:
@@ -431,6 +505,7 @@ def _format_groups_page(session: TelethonSession, groups: Sequence[Mapping[str, 
 
 async def _handle_cancel(event: NewMessage.Event, manager: GroupUploadStateManager, message: str) -> None:
     user_id = event.sender_id
+    manager.neutralize(user_id)
     manager.clear(user_id)
     await event.respond(message, buttons=build_main_menu_keyboard())
 
@@ -441,19 +516,22 @@ def setup_group_commands(client, context: BotContext) -> None:
     upload_manager = context.groups_manager
     view_manager = context.group_view_manager
 
-    async def _get_active_sessions(user_id: int) -> Optional[List[TelethonSession]]:
+    async def _get_available_sessions(user_id: int) -> Optional[List[TelethonSession]]:
         try:
-            sessions_iter = await context.session_manager.get_active_sessions(
-                user_id,
-                verify_live=True,
-            )
+            sessions = await context.session_repository.list_sessions_for_owner(user_id)
         except Exception:
             logger.exception(
-                "Не удалось получить список активных аккаунтов",
+                "Не удалось получить список аккаунтов",
                 extra={"user_id": user_id},
             )
             return None
-        return list(sessions_iter)
+
+        if not sessions:
+            return []
+
+        # Prefer активные аккаунты, но позволяем пользователю выбирать и временно неактивные.
+        sessions.sort(key=lambda item: (not item.is_active, item.display_name().lower()))
+        return sessions
 
     async def _load_session_and_groups(session_id: str, cache: Mapping[str, TelethonSession]):
         session: Optional[TelethonSession] = None
@@ -470,6 +548,76 @@ def setup_group_commands(client, context: BotContext) -> None:
             return None
         groups = _extract_groups(session.metadata)
         return session, groups
+
+    async def _refresh_upload_state_sessions(user_id: int) -> Optional[object]:
+        sessions = await _get_available_sessions(user_id)
+        if sessions is None:
+            return None
+        snapshot_map = _prepare_upload_snapshots(sessions)
+        state = upload_manager.update(
+            user_id,
+            sessions=snapshot_map,
+            allowed_session_ids=list(snapshot_map.keys()),
+        )
+        return state
+
+    async def _ensure_upload_snapshot(
+        user_id: int,
+        state,
+        session_id: str,
+        *,
+        ensure_cached: bool,
+    ) -> tuple[object, Optional[UploadAccountSnapshot]]:
+        sessions_map = getattr(state, "sessions", None)
+        if not isinstance(sessions_map, dict):
+            sessions_map = {}
+            setattr(state, "sessions", sessions_map)
+        snapshot = sessions_map.get(session_id)
+        if snapshot is None:
+            refreshed_state = await _refresh_upload_state_sessions(user_id)
+            if refreshed_state is None:
+                return state, None
+            state = refreshed_state
+            sessions_map = getattr(state, "sessions", None)
+            if not isinstance(sessions_map, dict):
+                sessions_map = {}
+                setattr(state, "sessions", sessions_map)
+            snapshot = sessions_map.get(session_id)
+        if snapshot is None:
+            try:
+                session_obj = await context.session_repository.get_by_session_id(session_id)
+            except Exception:
+                logger.exception(
+                    "Не удалось получить данные аккаунта при проверке выбора",
+                    extra={"session_id": session_id, "user_id": user_id},
+                )
+                session_obj = None
+            if session_obj is not None and session_obj.owner_id == user_id:
+                snapshot = _build_upload_snapshot(session_obj)
+                sessions_map[session_id] = snapshot
+                allowed = getattr(state, "allowed_session_ids", None)
+                if not isinstance(allowed, list):
+                    allowed = []
+                    setattr(state, "allowed_session_ids", allowed)
+                if session_id not in allowed:
+                    allowed.append(session_id)
+        if snapshot is None or snapshot.owner_id != user_id:
+            return state, None
+        if ensure_cached:
+            cached = snapshot.cached_session
+            if cached is None or cached.owner_id != user_id:
+                try:
+                    session_obj = await context.session_repository.get_by_session_id(session_id)
+                except Exception:
+                    logger.exception(
+                        "Не удалось обновить данные аккаунта для загрузки групп",
+                        extra={"session_id": session_id, "user_id": user_id},
+                    )
+                    return state, None
+                if session_obj is None or session_obj.owner_id != user_id:
+                    return state, None
+                _touch_snapshot(snapshot, session_obj)
+        return state, snapshot
 
     @client.on(events.NewMessage(pattern=UPLOAD_GROUPS_PATTERN))
     async def handle_upload_groups(event: NewMessage.Event) -> None:
@@ -491,7 +639,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             )
             return
 
-        sessions = await _get_active_sessions(user_id)
+        sessions = await _get_available_sessions(user_id)
         if sessions is None:
             await event.respond(
                 "Не удалось получить список аккаунтов. Попробуйте позже.",
@@ -505,16 +653,18 @@ def setup_group_commands(client, context: BotContext) -> None:
             )
             return
 
-        upload_manager.begin(
+        snapshot_map = _prepare_upload_snapshots(sessions)
+        state = upload_manager.begin(
             user_id,
             step=GroupUploadStep.CHOOSING_SCOPE,
             scope=GroupUploadScope.SINGLE,
-            sessions={session.session_id: session for session in sessions},
+            sessions=snapshot_map,
+            allowed_session_ids=list(snapshot_map.keys()),
             last_message_id=event.id,
         )
         message = await event.respond(
             "Для каких аккаунтов загрузить список групп?",
-            buttons=_build_upload_scope_buttons(),
+            buttons=_build_upload_scope_buttons(state.flow_id),
         )
         upload_manager.update(user_id, last_message_id=message.id)
 
@@ -526,18 +676,33 @@ def setup_group_commands(client, context: BotContext) -> None:
             await event.answer("Эта операция больше неактуальна.", alert=True)
             return
 
-        selection = event.data.decode("utf-8").split(":", maxsplit=1)[-1]
-        sessions = list(state.sessions.values())
+        parsed = _parse_callback_payload(event.data, UPLOAD_SCOPE_PREFIX)
+        if parsed is None:
+            await event.answer("Некорректный запрос.", alert=True)
+            return
+
+        flow_id, parts = parsed
+        if not parts:
+            await event.answer("Некорректный выбор.", alert=True)
+            return
+        selection = parts[0]
+
+        if flow_id != state.flow_id:
+            await event.answer("Сценарий загрузки устарел. Запустите /upload_groups заново.", alert=True)
+            return
+
+        sessions = list(state.sessions.values()) if state.sessions else []
 
         if selection == UPLOAD_SCOPE_SINGLE:
             if not sessions:
                 upload_manager.clear(user_id)
                 await event.edit("Нет доступных аккаунтов для загрузки.", buttons=build_main_menu_keyboard())
                 return
+            upload_manager.reset_targets(user_id)
             upload_manager.update(user_id, scope=GroupUploadScope.SINGLE, step=GroupUploadStep.CHOOSING_ACCOUNT)
             message = await event.edit(
                 "Выберите аккаунт, для которого нужно загрузить список групп.",
-                buttons=_build_upload_account_buttons(sessions),
+                buttons=_build_upload_account_buttons(state.flow_id, sessions),
             )
             upload_manager.update(user_id, last_message_id=message.id)
             return
@@ -548,17 +713,17 @@ def setup_group_commands(client, context: BotContext) -> None:
                 await event.edit("Нет доступных аккаунтов для загрузки.", buttons=build_main_menu_keyboard())
                 return
             session_ids = [session.session_id for session in sessions]
-            upload_manager.update(
-                user_id,
-                scope=GroupUploadScope.ALL,
-                target_session_ids=session_ids,
+            upload_manager.reset_targets(user_id)
+            upload_manager.set_all_targets(user_id, session_ids)
+            has_existing = any(
+                snapshot.cached_session is not None and _extract_groups(snapshot.cached_session.metadata)
+                for snapshot in sessions
             )
-            has_existing = any(_extract_groups(session.metadata) for session in sessions)
             if has_existing:
                 upload_manager.update(user_id, step=GroupUploadStep.CONFIRMING_REPLACE)
                 message = await event.edit(
                     "В некоторых аккаунтах уже есть список групп. Заменить его для всех аккаунтов?",
-                    buttons=_build_upload_confirmation_buttons(GroupUploadScope.ALL),
+                    buttons=_build_upload_confirmation_buttons(state.flow_id, GroupUploadScope.ALL),
                 )
             else:
                 upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
@@ -579,25 +744,56 @@ def setup_group_commands(client, context: BotContext) -> None:
             await event.answer("Эта операция больше неактуальна.", alert=True)
             return
 
-        session_id = event.data.decode("utf-8").split(":", maxsplit=1)[-1]
-        session = state.sessions.get(session_id)
-        if session is None:
-            await event.answer("Аккаунт не найден.", alert=True)
+        parsed = _parse_callback_payload(event.data, SELECT_PREFIX)
+        if parsed is None:
+            await event.answer("Некорректный запрос.", alert=True)
             return
 
-        upload_manager.update(
-            user_id,
-            scope=GroupUploadScope.SINGLE,
-            target_session_ids=[session_id],
-            target_session_id=session_id,
-        )
+        flow_id, parts = parsed
+        if not parts:
+            await event.answer("Не удалось определить аккаунт. Запустите загрузку заново.", alert=True)
+            return
+        session_id = _join_session_identifier(parts)
+        if not session_id:
+            await event.answer("Не удалось определить аккаунт. Запустите загрузку заново.", alert=True)
+            return
 
-        existing = _extract_groups(session.metadata)
+        if flow_id != state.flow_id:
+            await event.answer("Сценарий загрузки устарел. Запустите /upload_groups заново.", alert=True)
+            return
+
+        if not state.sessions:
+            refreshed_state = await _refresh_upload_state_sessions(user_id)
+            if refreshed_state is None or not getattr(refreshed_state, "sessions", None):
+                upload_manager.clear(user_id)
+                await event.answer("Список аккаунтов устарел. Начните загрузку заново.", alert=True)
+                return
+            state = refreshed_state
+
+        state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=True)
+        if snapshot is None:
+            upload_manager.reset_targets(user_id)
+            await event.answer("Не удалось подтвердить выбранный аккаунт. Запустите загрузку заново.", alert=True)
+            return
+
+        upload_manager.reset_targets(user_id)
+        updated_state = upload_manager.set_single_target(user_id, session_id)
+        if updated_state is None:
+            await event.answer("Выбор аккаунта устарел. Начните загрузку заново.", alert=True)
+            return
+        state = updated_state
+
+        session_obj = snapshot.cached_session
+        existing = _extract_groups(session_obj.metadata) if session_obj is not None else []
         if existing:
+            token = upload_manager.register_confirmation_token(user_id, session_id)
+            if not token:
+                await event.answer("Не удалось подготовить подтверждение. Повторите попытку.", alert=True)
+                return
             upload_manager.update(user_id, step=GroupUploadStep.CONFIRMING_REPLACE)
             message = await event.edit(
                 "Для выбранного аккаунта уже есть список групп. Заменить его?",
-                buttons=_build_upload_confirmation_buttons(GroupUploadScope.SINGLE, session_id),
+                buttons=_build_upload_confirmation_buttons(state.flow_id, GroupUploadScope.SINGLE, token),
             )
         else:
             upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
@@ -615,14 +811,25 @@ def setup_group_commands(client, context: BotContext) -> None:
             await event.answer("Эта операция больше неактуальна.", alert=True)
             return
 
-        parts = event.data.decode("utf-8").split(":")
-        if len(parts) < 3:
+        parsed = _parse_callback_payload(event.data, CONFIRM_PREFIX)
+        if parsed is None:
             await event.answer("Некорректный запрос.", alert=True)
             return
-        _, scope_marker, decision, *rest = parts
+
+        flow_id, parts = parsed
+        if len(parts) < 2:
+            await event.answer("Некорректный запрос.", alert=True)
+            return
+
+        scope_marker, decision, *rest = parts
         scope = GroupUploadScope.ALL if scope_marker == UPLOAD_SCOPE_ALL else GroupUploadScope.SINGLE
 
+        if flow_id != state.flow_id:
+            await event.answer("Сценарий загрузки устарел. Запустите /upload_groups заново.", alert=True)
+            return
+
         if decision == "no":
+            upload_manager.neutralize(user_id)
             upload_manager.clear(user_id)
             await event.edit("Загрузка списка групп отменена.", buttons=build_main_menu_keyboard())
             return
@@ -635,9 +842,24 @@ def setup_group_commands(client, context: BotContext) -> None:
             if not rest:
                 await event.answer("Некорректный запрос.", alert=True)
                 return
-            session_id = rest[0]
-            if session_id not in (state.target_session_ids or []):
-                await event.answer("Некорректный аккаунт.", alert=True)
+            session_token = rest[0].strip()
+            if not session_token:
+                await event.answer("Некорректный запрос.", alert=True)
+                return
+            session_id = upload_manager.consume_confirmation_token(user_id, session_token)
+            selected_id = getattr(state, "selected_session_id", None)
+            target_ids = list(state.target_session_ids or [])
+            if not session_id or not selected_id or not target_ids:
+                upload_manager.reset_targets(user_id)
+                await event.answer("Аккаунт не выбран. Повторите выбор.", alert=True)
+                return
+            if session_id != selected_id or session_id not in target_ids:
+                upload_manager.reset_targets(user_id)
+                await event.answer("Выбор аккаунта устарел. Выберите аккаунт заново.", alert=True)
+                return
+            if session_id not in state.sessions:
+                upload_manager.clear(user_id)
+                await event.answer("Список аккаунтов устарел. Запустите загрузку заново.", alert=True)
                 return
 
         upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
@@ -650,9 +872,25 @@ def setup_group_commands(client, context: BotContext) -> None:
     @client.on(events.CallbackQuery(pattern=rf"^{CANCEL_PREFIX}:".encode("utf-8")))
     async def handle_upload_inline_cancel(event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
+        state = upload_manager.get(user_id)
+        if state is None:
+            await event.answer("Нечего отменять.", alert=True)
+            return
+
+        parsed = _parse_callback_payload(event.data, CANCEL_PREFIX)
+        if parsed is None:
+            await event.answer("Некорректный запрос.", alert=True)
+            return
+
+        flow_id, _ = parsed
+        if flow_id != state.flow_id:
+            await event.answer("Сценарий загрузки устарел. Запустите /upload_groups заново.", alert=True)
+            return
+
         if not upload_manager.has_active_flow(user_id):
             await event.answer("Нечего отменять.", alert=True)
             return
+        upload_manager.neutralize(user_id)
         upload_manager.clear(user_id)
         await event.edit("Загрузка списка групп отменена.", buttons=build_main_menu_keyboard())
 
@@ -718,26 +956,69 @@ def setup_group_commands(client, context: BotContext) -> None:
             logger.warning("Состояние загрузки групп потеряно", extra={"user_id": user_id})
             await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
             return
+
         target_ids = list(state.target_session_ids or [])
-        if not target_ids and state.target_session_id:
-            target_ids = [state.target_session_id]
-        if not target_ids:
-            logger.warning("Нет целевых аккаунтов для сохранения групп", extra={"user_id": user_id})
-            await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
-            return
+        resolved_snapshots: list[UploadAccountSnapshot] = []
+
+        if state.scope == GroupUploadScope.SINGLE:
+            selected_id = getattr(state, "selected_session_id", None)
+            if not selected_id:
+                logger.warning("Нет выбранного аккаунта при загрузке одиночного списка групп", extra={"user_id": user_id})
+                await _handle_cancel(event, upload_manager, "Аккаунт не выбран. Запустите загрузку заново.")
+                return
+            state, snapshot = await _ensure_upload_snapshot(user_id, state, selected_id, ensure_cached=True)
+            if snapshot is None:
+                logger.warning(
+                    "Не удалось подтвердить выбранный аккаунт при загрузке файла",
+                    extra={"user_id": user_id, "session_id": selected_id},
+                )
+                await _handle_cancel(event, upload_manager, "Выбор аккаунта устарел. Запустите загрузку заново.")
+                return
+            target_ids = [snapshot.session_id]
+            resolved_snapshots.append(snapshot)
+        else:
+            if not target_ids:
+                logger.warning("Нет целевых аккаунтов для сохранения групп", extra={"user_id": user_id})
+                await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
+                return
+            sanitized_ids: list[str] = []
+            for session_id in target_ids:
+                state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=False)
+                if snapshot is None:
+                    logger.warning(
+                        "Целевой аккаунт недоступен при загрузке файла",
+                        extra={"user_id": user_id, "session_id": session_id},
+                    )
+                    await _handle_cancel(event, upload_manager, "Список аккаунтов устарел. Запустите загрузку заново.")
+                    return
+                sanitized_ids.append(snapshot.session_id)
+                resolved_snapshots.append(snapshot)
+            target_ids = sanitized_ids
 
         enriched_groups = []
         for group in parsed_groups:
             chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
             enriched_groups.append(_serialize_group(group, chat_id, is_member))
 
+            operation_scope = state.scope
         try:
-            if state.scope == GroupUploadScope.ALL:
-                updated = await context.session_repository.set_broadcast_groups_bulk(target_ids, enriched_groups)
+            if operation_scope == GroupUploadScope.ALL:
+                updated = await context.session_repository.set_broadcast_groups_bulk(
+                    target_ids,
+                    enriched_groups,
+                    owner_id=user_id,
+                )
                 if updated == 0:
                     raise RuntimeError("Не удалось обновить ни один аккаунт")
+                if updated < len(target_ids):
+                    raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
+                upload_manager.reset_targets(user_id)
             else:
-                success = await context.session_repository.set_broadcast_groups(target_ids[0], enriched_groups)
+                success = await context.session_repository.set_broadcast_groups(
+                    target_ids[0],
+                    enriched_groups,
+                    owner_id=user_id,
+                )
                 if not success:
                     raise RuntimeError("Не удалось обновить выбранный аккаунт")
         except Exception:
@@ -752,11 +1033,11 @@ def setup_group_commands(client, context: BotContext) -> None:
             )
             return
 
-        if state.scope == GroupUploadScope.ALL:
+        if operation_scope == GroupUploadScope.ALL:
             success_text = "Список групп для рассылки успешно загружен для всех подключённых аккаунтов."
         else:
-            session_obj = state.sessions.get(target_ids[0])
-            label = _render_session_label(session_obj) if session_obj else "выбранного аккаунта"
+            snapshot = resolved_snapshots[0] if resolved_snapshots else None
+            label = snapshot.label if snapshot else "выбранного аккаунта"
             success_text = f"Список групп для аккаунта {label} успешно обновлён."
 
         logger.info(
@@ -766,6 +1047,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             len(enriched_groups),
         )
 
+        upload_manager.neutralize(user_id)
         upload_manager.clear(user_id)
         await event.respond(success_text, buttons=build_main_menu_keyboard())
 
@@ -789,7 +1071,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             )
             return
 
-        sessions = await _get_active_sessions(user_id)
+        sessions = await _get_available_sessions(user_id)
         if sessions is None:
             await event.respond(
                 "Не удалось получить список аккаунтов. Попробуйте позже.",
