@@ -87,6 +87,8 @@ BROADCAST_DELAY_MIN_SECONDS = 2
 BROADCAST_DELAY_MAX_SECONDS = 5
 BROADCAST_BATCH_SIZE = 5
 BROADCAST_BATCH_PAUSE_SECONDS = 10
+SECONDARY_ACCOUNT_DELAY_MIN_SECONDS = 4.0
+SECONDARY_ACCOUNT_DELAY_MAX_SECONDS = 9.0
 
 
 logger = logging.getLogger(__name__)
@@ -208,10 +210,16 @@ class BroadcastPlan:
 	"""Aggregated data for executing a broadcast run."""
 
 	sessions: list[SessionBroadcastPlan]
-	total_groups: int
+	total_target_count: int
 	unique_groups_total: int
 	rows_total: int
 	peer_identities: Set[tuple[str, object | tuple]] = field(default_factory=set)
+
+	@property
+	def total_groups(self) -> int:
+		"""Backward-compatible alias for the total target count."""
+
+		return self.total_target_count
 
 	def has_text(self) -> bool:
 		return any(entry.has_text() for entry in self.sessions)
@@ -546,6 +554,10 @@ def _estimate_remaining_seconds(groups_left: int) -> float:
 	return _estimate_total_seconds(groups_left)
 
 
+def _random_secondary_account_delay() -> float:
+	return random.uniform(SECONDARY_ACCOUNT_DELAY_MIN_SECONDS, SECONDARY_ACCOUNT_DELAY_MAX_SECONDS)
+
+
 def _format_duration(seconds: float) -> str:
 	rounded = int(max(0, round(seconds)))
 	if rounded <= 0:
@@ -563,11 +575,13 @@ def _format_duration(seconds: float) -> str:
 
 
 def _build_confirmation_text(plan: BroadcastPlan) -> str:
-	lines = [f"Будет отправлено в {plan.total_groups} уникальные группы."]
+	lines = [f"Будет отправлено примерно в {plan.total_groups} целевых чатов (учитывая выбранные аккаунты)."]
 	if plan.rows_total:
 		lines.append(f"Строк в файлах: {plan.rows_total}.")
 	if plan.unique_groups_total and plan.unique_groups_total != plan.total_groups:
-		lines.append(f"Уникальных записей в списке: {plan.unique_groups_total}.")
+		lines.append(
+			f"Без учёта аккаунтов найдено {plan.unique_groups_total} уникальных чатов."
+		)
 	if len(plan.sessions) == 1:
 		lines.append(f"Выбранный аккаунт: {plan.session_labels()[0]}.")
 	else:
@@ -908,19 +922,19 @@ async def _build_broadcast_plan(
 		rows_total += rows_for_account
 		global_peer_keys.update(peer_keys)
 
-	if plans and not global_peer_keys:
+	total_targets = sum(entry.actual_target_count for entry in plans)
+	if plans and total_targets <= 0:
 		errors.append("Не удалось определить группы для рассылки. Загрузите их через /upload_groups.")
 	unique_groups_total = len(deduplicate_broadcast_groups(aggregated_unique_groups)) if aggregated_unique_groups else 0
-	total_unique_peers = len(global_peer_keys)
 	plan = (
 		BroadcastPlan(
 			sessions=plans,
-			total_groups=total_unique_peers,
+			total_target_count=total_targets,
 			unique_groups_total=unique_groups_total,
 			rows_total=rows_total,
 			peer_identities=set(global_peer_keys),
 		)
-		if plans and total_unique_peers > 0
+		if plans and total_targets > 0
 		else None
 	)
 	return plan, errors
@@ -1003,11 +1017,13 @@ async def _execute_broadcast_plan(
 		return bool(state and state.cancel_requested)
 
 	async def _update_progress(status: str) -> None:
-		remaining = max(0, plan.total_groups - processed)
+		total_targets = plan.total_groups
+		processed_display = min(processed, total_targets)
+		remaining = max(0, total_targets - processed_display)
 		text = _build_progress_text(
 			status,
-			total=plan.total_groups,
-			processed=processed,
+			total=total_targets,
+			processed=processed_display,
 			success=success,
 			failed=failed,
 			current_account=current_account_label,
@@ -1069,7 +1085,7 @@ async def _execute_broadcast_plan(
 	try:
 		await _update_progress(status_message)
 
-		for entry in plan.sessions:
+		for account_index, entry in enumerate(plan.sessions):
 			if _is_cancelled():
 				break
 
@@ -1313,6 +1329,9 @@ async def _execute_broadcast_plan(
 								await asyncio.sleep(
 									random.randint(BROADCAST_DELAY_MIN_SECONDS, BROADCAST_DELAY_MAX_SECONDS)
 								)
+							if account_index >= 1 and not (_is_cancelled() or session_inactive):
+								extra_delay = _random_secondary_account_delay()
+								await asyncio.sleep(extra_delay)
 
 					if _is_cancelled():
 						break
@@ -1333,7 +1352,9 @@ async def _execute_broadcast_plan(
 			summary_lines.append(f"С ошибками: {failed}")
 		summary_lines.append(f"Целевых чатов: {plan.total_groups}")
 		if plan.unique_groups_total and plan.unique_groups_total != plan.total_groups:
-			summary_lines.append(f"Уникальных записей в списке: {plan.unique_groups_total}")
+			summary_lines.append(
+				f"Без учёта аккаунтов: {plan.unique_groups_total} уникальных чатов"
+			)
 		if plan.rows_total:
 			summary_lines.append(f"Строк в файлах: {plan.rows_total}")
 		_log_broadcast(
@@ -1371,7 +1392,7 @@ async def _execute_broadcast_plan(
 		error_text = _build_progress_text(
 			"Рассылка прервана из-за ошибки",
 			plan.total_groups,
-			processed,
+			min(processed, plan.total_groups),
 			success,
 			failed,
 			current_account_label,

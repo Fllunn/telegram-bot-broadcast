@@ -45,6 +45,8 @@ from src.utils.timezone import format_moscow_time
 logger = logging.getLogger(__name__)
 
 SHUFFLE_RANDOM = random.SystemRandom()
+SECONDARY_ACCOUNT_DELAY_MIN_SECONDS = 4.0
+SECONDARY_ACCOUNT_DELAY_MAX_SECONDS = 9.0
 AUTH_ERRORS: Tuple[type[BaseException], ...] = (
     AuthKeyUnregisteredError,
     SessionRevokedError,
@@ -185,7 +187,7 @@ class AutoBroadcastRunner:
         notify_task = asyncio.create_task(self._notify_cycle_start(task, sessions)) if task.notify_each_cycle else None
 
         try:
-            for session in sessions:
+            for account_index, session in enumerate(sessions):
                 if self._stop_event.is_set():
                     break
                 if not await self._is_account_available(session):
@@ -212,6 +214,7 @@ class AutoBroadcastRunner:
                     sent, failed = await self._process_account(
                         task,
                         session,
+                        account_index=account_index,
                         resume_batch_index=batch_index,
                         resume_group_index=group_index,
                         delivered_peer_keys=global_delivered_peer_keys,
@@ -512,6 +515,7 @@ class AutoBroadcastRunner:
         task: AutoBroadcastTask,
         session: TelethonSession,
         *,
+        account_index: int,
         resume_batch_index: int,
         resume_group_index: int,
         delivered_peer_keys: Set[tuple[str, object | tuple]],
@@ -543,6 +547,7 @@ class AutoBroadcastRunner:
         account_label = session.display_name()
         session_inactive = False
         last_health_check = 0.0
+        is_secondary_account = account_index >= 1
 
         async def _ensure_account_active(force: bool = False) -> bool:
             nonlocal last_health_check, session_inactive
@@ -746,7 +751,11 @@ class AutoBroadcastRunner:
                         or index + 1 < len(groups)
                     )
                     if has_more_targets and not self._stop_event.is_set():
-                        await self._sleep_between_messages(message_counter, batch_size)
+                        await self._sleep_between_messages(
+                            message_counter,
+                            batch_size,
+                            is_secondary_account=is_secondary_account,
+                        )
 
                 absolute_index = index + 1
                 batch_index = absolute_index // batch_size
@@ -804,7 +813,13 @@ class AutoBroadcastRunner:
             mime_type=image_payload.mime_type,
         )
 
-    async def _sleep_between_messages(self, message_counter: int, batch_size: int) -> None:
+    async def _sleep_between_messages(
+        self,
+        message_counter: int,
+        batch_size: int,
+        *,
+        is_secondary_account: bool,
+    ) -> None:
         if self._stop_event.is_set():
             return
         batch_size = max(1, batch_size)
@@ -813,6 +828,9 @@ class AutoBroadcastRunner:
         else:
             delay = self._random_message_delay()
         await self._delayed_wait(delay)
+        if is_secondary_account and not self._stop_event.is_set():
+            extra_delay = self._random_secondary_account_delay()
+            await self._delayed_wait(extra_delay)
 
     @staticmethod
     def _random_message_delay() -> float:
@@ -822,6 +840,10 @@ class AutoBroadcastRunner:
     def _random_batch_pause() -> float:
         base = float(BROADCAST_BATCH_PAUSE_SECONDS)
         return random.uniform(base * 0.75, base * 1.25)
+
+    @staticmethod
+    def _random_secondary_account_delay() -> float:
+        return random.uniform(SECONDARY_ACCOUNT_DELAY_MIN_SECONDS, SECONDARY_ACCOUNT_DELAY_MAX_SECONDS)
 
     async def _notify_cycle_start(self, task: AutoBroadcastTask, sessions: Iterable[TelethonSession]) -> None:
         await asyncio.sleep(0)  # allow calling context to proceed
