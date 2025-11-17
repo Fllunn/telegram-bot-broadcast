@@ -49,6 +49,9 @@ logs/
 .env.*
 *.env
 
+# Allow sharing example env files
+!.env.example
+
 # Telethon sessions & temporary data
 *.session
 *.session-journal
