@@ -224,6 +224,12 @@ def _resolved_target_identity(target: ResolvedGroupTarget) -> tuple[str, object 
     return ("label", label)
 
 
+def resolved_target_identity(target: ResolvedGroupTarget) -> tuple[str, object | tuple]:
+    """Public helper returning identity tuple for a resolved broadcast target."""
+
+    return _resolved_target_identity(target)
+
+
 async def collect_unique_target_peer_keys(
     client,
     groups: Sequence[Mapping[str, object]],

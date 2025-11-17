@@ -12,6 +12,11 @@ from telethon.events import CallbackQuery, NewMessage
 
 from src.bot.context import BotContext
 from src.bot.keyboards import AUTO_STATUS_LABEL, STOP_AUTO_LABEL, build_main_menu_keyboard
+from src.config.broadcast_settings import (
+    BROADCAST_BATCH_PAUSE_SECONDS,
+    BROADCAST_DELAY_MAX_SECONDS,
+    BROADCAST_DELAY_MIN_SECONDS,
+)
 from src.models.auto_broadcast import AccountMode, AutoBroadcastTask, GroupTarget, TaskStatus
 from src.services.auto_broadcast.engine import AccountInUseError, InvalidIntervalError
 from src.services.auto_broadcast.payloads import extract_image_metadata
@@ -25,6 +30,12 @@ from src.services.auto_broadcast.intervals import (
 from src.services.auto_broadcast.state_manager import (
     AutoTaskSetupState,
     AutoTaskSetupStep,
+)
+from src.services.broadcast_shared import (
+    DialogsFetchError,
+    collect_unique_target_peer_keys,
+    deduplicate_broadcast_groups,
+    describe_content_payload,
 )
 from src.utils.timezone import format_moscow_time
 
@@ -97,6 +108,170 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     service = context.auto_broadcast_service
     state_manager = service.state_manager
 
+    def _coerce_positive_int(value: object, *, default: int = 0) -> int:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return number if number > 0 else default
+
+    def _extract_metadata_groups(metadata: Mapping[str, object]) -> List[dict[str, object]]:
+        if not isinstance(metadata, Mapping):
+            return []
+        unique_source = metadata.get("broadcast_groups_unique")
+        if isinstance(unique_source, list) and unique_source:
+            prepared: List[dict[str, object]] = []
+            for entry in unique_source:
+                if isinstance(entry, Mapping):
+                    prepared.append(dict(entry))
+            if prepared:
+                return prepared
+        raw_source = metadata.get("broadcast_groups")
+        raw_groups: List[Mapping[str, object]] = []
+        if isinstance(raw_source, list) and raw_source:
+            for entry in raw_source:
+                if isinstance(entry, Mapping):
+                    raw_groups.append(entry)
+        if not raw_groups:
+            return []
+        deduplicated = deduplicate_broadcast_groups(raw_groups)
+        return [dict(entry) for entry in deduplicated]
+
+    def _build_stats_lines(actual: int, rows: int, unique: int) -> List[str]:
+        lines: List[str] = [f"Будет отправлено в {actual} уникальные группы."]
+        if rows:
+            lines.append(f"Строк в файлах: {rows}.")
+        if unique and unique != actual:
+            lines.append(f"Уникальных записей в списке: {unique}.")
+        return lines
+
+    def _describe_materials_line(has_text: bool, has_image: bool) -> str:
+        text_label = "есть" if has_text else "нет"
+        image_label = "есть" if has_image else "нет"
+        return f"Материалы: текст — {text_label}, картинка — {image_label}."
+
+    def _format_duration(seconds: float) -> str:
+        rounded = int(max(0, round(seconds)))
+        if rounded <= 0:
+            return "< 1 сек"
+        hours, remainder = divmod(rounded, 3600)
+        minutes, secs = divmod(remainder, 60)
+        parts: List[str] = []
+        if hours:
+            parts.append(f"{hours} ч")
+        if minutes:
+            parts.append(f"{minutes} мин")
+        if secs or not parts:
+            parts.append(f"{secs} сек")
+        return " ".join(parts)
+
+    def _estimate_total_seconds(groups_count: int, batch_size: Optional[int] = None) -> float:
+        if groups_count <= 0:
+            return 0.0
+        average_delay = (BROADCAST_DELAY_MIN_SECONDS + BROADCAST_DELAY_MAX_SECONDS) / 2
+        total = groups_count * average_delay
+        if groups_count > 0:
+            effective_batch = max(1, int(batch_size or service.default_batch_size))
+            batches = max(0, (groups_count - 1) // effective_batch)
+            total += batches * BROADCAST_BATCH_PAUSE_SECONDS
+        return total
+
+    def _aggregate_account_stats(
+        account_ids: Sequence[str],
+        stats_map: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        total_actual = 0
+        total_rows = 0
+        total_unique = 0
+        any_text = False
+        any_image = False
+        seen: set[str] = set()
+        for account_id in account_ids:
+            if not account_id or account_id in seen:
+                continue
+            seen.add(account_id)
+            stats = stats_map.get(account_id, {}) if isinstance(stats_map, Mapping) else {}
+            actual_value = _coerce_positive_int(
+                stats.get("actual_target_groups")
+                or stats.get("actual_targets"),
+                default=0,
+            )
+            rows_value = _coerce_positive_int(
+                stats.get("rows_in_file")
+                or stats.get("file_rows"),
+                default=0,
+            )
+            unique_value = _coerce_positive_int(
+                stats.get("unique_entries_in_file")
+                or stats.get("unique_groups"),
+                default=0,
+            )
+            total_actual += actual_value
+            total_rows += rows_value
+            total_unique += unique_value
+            if bool(stats.get("has_text")):
+                any_text = True
+            if bool(stats.get("has_image")):
+                any_image = True
+        return {
+            "actual": max(0, total_actual),
+            "rows": max(0, total_rows),
+            "unique": max(0, total_unique),
+            "has_text": any_text,
+            "has_image": any_image,
+        }
+
+    async def _calculate_actual_targets_for_session(
+        session,
+        groups: Sequence[Mapping[str, object]],
+        *,
+        user_id: int,
+        account_label: str,
+        fallback: int,
+        content_type: Optional[str],
+    ) -> int:
+        if not groups:
+            return 0
+        session_client = None
+        try:
+            session_client = await context.session_manager.build_client_from_session(session)
+            peer_keys = await collect_unique_target_peer_keys(
+                session_client,
+                groups,
+                user_id=user_id,
+                account_label=account_label,
+                account_session_id=session.session_id,
+                content_type=content_type,
+            )
+            return len(peer_keys)
+        except DialogsFetchError as exc:
+            logger.warning(
+                "Не удалось проверить список чатов при подготовке авторассылки",
+                extra={
+                    "user_id": user_id,
+                    "session_id": session.session_id,
+                    "reason": exc.error_type,
+                },
+            )
+            return fallback
+        except Exception:
+            logger.exception(
+                "Не удалось рассчитать фактические целевые чаты для авторассылки",
+                extra={"session_id": session.session_id, "user_id": user_id},
+            )
+            return fallback
+        finally:
+            if session_client is not None:
+                try:
+                    await context.session_manager.close_client(session_client)
+                except Exception:
+                    logger.exception(
+                        "Не удалось закрыть клиент Telethon после расчёта целевых групп",
+                        extra={"session_id": session.session_id},
+                    )
+
     def _stop_menu_buttons() -> List[List[Button]]:
         return [
             [Button.inline(STOP_SINGLE_LABEL, f"{STOP_MENU_CALLBACK}:{STOP_SINGLE_OPTION}".encode("utf-8"))],
@@ -108,15 +283,16 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         counts: Dict[str, int] = {}
         account_groups: Dict[str, List[GroupTarget]] = {}
         account_labels: Dict[str, str] = {}
+        account_stats: Dict[str, Dict[str, object]] = {}
         fsm_step = AutoTaskSetupStep.CHOOSING_MODE
         has_materials = False
 
         for session in sessions:
             metadata = session.metadata or {}
             metadata_mapping: Mapping[str, object] = metadata if isinstance(metadata, Mapping) else {}
-            raw_groups = metadata_mapping.get("broadcast_groups") if metadata_mapping else None
+            prepared_groups = _extract_metadata_groups(metadata_mapping)
 
-            if not raw_groups:
+            if not prepared_groups:
                 logger.warning(
                     "Auto-task session metadata does not contain groups",
                     extra={
@@ -127,15 +303,30 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 )
 
             raw_text = metadata_mapping.get("broadcast_text") if metadata_mapping else None
-            session_has_materials = False
-            if isinstance(raw_text, str) and raw_text.strip():
-                has_materials = True
-                session_has_materials = True
-            elif extract_image_metadata(metadata_mapping):
-                has_materials = True
-                session_has_materials = True
+            text_value = None
+            if isinstance(raw_text, str):
+                text_value = raw_text.strip()
+            elif raw_text is not None:
+                text_value = str(raw_text).strip()
+            has_text_value = bool(text_value)
 
-            if not session_has_materials:
+            image_meta = extract_image_metadata(metadata_mapping)
+            has_image_value = bool(image_meta)
+            if image_meta and image_meta.get("legacy_file_id"):
+                logger.warning(
+                    "Сохранённая картинка устарела и будет пропущена",
+                    extra={
+                        "user_id": event.sender_id,
+                        "session_id": session.session_id,
+                    },
+                )
+                image_meta = None
+                has_image_value = False
+
+            session_has_materials = bool(has_text_value or has_image_value)
+            if session_has_materials:
+                has_materials = True
+            else:
                 logger.info(
                     "Auto-task session skipped due to missing materials",
                     extra={
@@ -144,9 +335,13 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                     },
                 )
 
-            valid_targets = service.build_group_targets(raw_groups)
             targets: List[GroupTarget] = []
-            for candidate in valid_targets:
+            usable_group_entries: List[dict[str, object]] = []
+            for entry in prepared_groups:
+                normalized = service.build_group_targets([entry])
+                if not normalized:
+                    continue
+                candidate = normalized[0]
                 if isinstance(candidate.metadata, Mapping) and candidate.metadata.get("is_member") is False:
                     logger.warning(
                         "Skipping group for auto-task setup: no membership",
@@ -160,12 +355,18 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                         },
                     )
                     continue
-                if service.is_valid_group(candidate):
-                    targets.append(candidate)
-            if raw_groups and not targets:
-                raw_count = None
-                if isinstance(raw_groups, (list, tuple)):
-                    raw_count = len(raw_groups)
+                if not service.is_valid_group(candidate):
+                    continue
+                candidate.source_session_id = session.session_id
+                targets.append(candidate)
+                entry_copy = dict(entry)
+                metadata_section = entry.get("metadata")
+                if isinstance(metadata_section, Mapping):
+                    entry_copy["metadata"] = dict(metadata_section)
+                usable_group_entries.append(entry_copy)
+
+            if prepared_groups and not targets:
+                raw_count = len(prepared_groups)
                 logger.warning(
                     "Auto-task session has raw groups but none passed validation",
                     extra={
@@ -174,12 +375,56 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                         "raw_count": raw_count,
                     },
                 )
+
+            stats_payload = metadata_mapping.get("broadcast_groups_stats") if isinstance(metadata_mapping, Mapping) else None
+            rows_from_stats = _coerce_positive_int(stats_payload.get("file_rows"), default=0) if isinstance(stats_payload, Mapping) else 0
+            unique_from_stats = _coerce_positive_int(stats_payload.get("unique_groups"), default=0) if isinstance(stats_payload, Mapping) else 0
+            actual_from_stats = _coerce_positive_int(stats_payload.get("actual_targets"), default=0) if isinstance(stats_payload, Mapping) else 0
+
+            rows_from_occurrences = 0
+            for entry in usable_group_entries:
+                source_occurrences = _coerce_positive_int(entry.get("source_occurrences"), default=1)
+                rows_from_occurrences += source_occurrences
+
+            unique_for_account = len(usable_group_entries)
+            rows_for_account = rows_from_stats or rows_from_occurrences or unique_for_account
+            unique_entries = unique_from_stats or unique_for_account
+
+            account_label_value = _session_account_label(session)
+            content_type = describe_content_payload(has_text_value, has_image_value)
+            actual_target_count = 0
+            if session_has_materials and usable_group_entries:
+                fallback_actual = actual_from_stats or unique_for_account
+                actual_target_count = await _calculate_actual_targets_for_session(
+                    session,
+                    usable_group_entries,
+                    user_id=event.sender_id,
+                    account_label=account_label_value,
+                    fallback=fallback_actual or unique_for_account,
+                    content_type=content_type,
+                )
+                if fallback_actual:
+                    actual_target_count = max(actual_target_count, fallback_actual)
+
+            if unique_for_account and actual_target_count <= 0 and session_has_materials:
+                actual_target_count = unique_for_account
+            if session_has_materials:
+                actual_target_count = max(actual_target_count, unique_for_account)
+
             usable_targets = targets if session_has_materials else []
-            counts[session.session_id] = len(usable_targets)
-            for target in usable_targets:
-                target.source_session_id = session.session_id
-            account_groups[session.session_id] = usable_targets
-            account_labels[session.session_id] = session.display_name()
+            account_groups[session.session_id] = usable_targets if session_has_materials else []
+            account_labels[session.session_id] = account_label_value
+            account_stats[session.session_id] = {
+                "rows_in_file": rows_for_account,
+                "unique_entries_in_file": unique_entries,
+                "actual_target_groups": actual_target_count,
+                "has_text": has_text_value,
+                "has_image": has_image_value,
+                "file_rows": rows_for_account,
+                "unique_groups": unique_for_account,
+                "actual_targets": actual_target_count,
+            }
+            counts[session.session_id] = int(max(0, actual_target_count))
         if not has_materials:
             logger.warning(
                 "Auto-task setup aborted: no broadcast materials",
@@ -204,13 +449,38 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             )
             state_manager.clear(event.sender_id)
             return
+
+        ordered_account_ids: List[str] = []
+        for session in sessions:
+            if counts.get(session.session_id, 0) > 0:
+                ordered_account_ids.append(session.session_id)
+
+        if not ordered_account_ids:
+            logger.warning(
+                "Auto-task setup aborted: no accounts with available targets",
+                extra={"user_id": event.sender_id, "fsm_step": fsm_step.value},
+            )
+            await event.respond(
+                "Нет доступных аккаунтов для авторассылки. Попробуйте обновить списки групп и материалы.",
+                buttons=build_main_menu_keyboard(),
+            )
+            state_manager.clear(event.sender_id)
+            return
+
+        filtered_counts = {account_id: counts[account_id] for account_id in ordered_account_ids}
+        filtered_labels = {account_id: account_labels[account_id] for account_id in ordered_account_ids}
+        filtered_groups = {account_id: account_groups[account_id] for account_id in ordered_account_ids}
+        filtered_stats = {account_id: account_stats[account_id] for account_id in ordered_account_ids}
+        total_groups = sum(filtered_counts.values())
+
         state = state_manager.begin(
             event.sender_id,
             step=AutoTaskSetupStep.CHOOSING_MODE,
-            available_account_ids=[session.session_id for session in sessions],
-            per_account_group_counts=counts,
-            account_labels=account_labels,
-            account_groups=account_groups,
+            available_account_ids=ordered_account_ids,
+            per_account_group_counts=filtered_counts,
+            account_labels=filtered_labels,
+            account_groups=filtered_groups,
+            account_group_stats=filtered_stats,
             total_groups=total_groups,
         )
         message = await event.respond(
@@ -554,27 +824,51 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
 
     def _render_confirmation_text(state: AutoTaskSetupState) -> str:
         if state.account_mode == AccountMode.SINGLE:
-            account_count = 1
-            account_line = state.account_labels.get(state.selected_account_id or "", "не выбран")
+            account_ids = [state.selected_account_id] if state.selected_account_id else []
         else:
-            account_count = len(state.available_account_ids)
-            account_line = f"{account_count} аккаунтов"
-        notify_line = "Включены" if state.notify_each_cycle else "Выключены"
+            account_ids = list(state.available_account_ids)
+
+        stats_map = state.account_group_stats if isinstance(state.account_group_stats, Mapping) else {}
+        aggregated = _aggregate_account_stats(account_ids, stats_map)
+
+        stats_lines = _build_stats_lines(
+            int(aggregated.get("actual", 0)),
+            int(aggregated.get("rows", 0)),
+            int(aggregated.get("unique", 0)),
+        )
+        lines = list(stats_lines)
+
+        if state.account_mode == AccountMode.SINGLE and account_ids:
+            account_label = state.account_labels.get(account_ids[0] or "", "не выбран")
+            lines.append(f"Выбранный аккаунт: {account_label}.")
+        else:
+            lines.append(f"Выбрано аккаунтов: {len(account_ids)}.")
+
+        lines.append(
+            _describe_materials_line(bool(aggregated.get("has_text")), bool(aggregated.get("has_image")))
+        )
+        lines.append("Рассылка будет проходить постепенно, с паузами для безопасности.")
+        estimated = _format_duration(
+            _estimate_total_seconds(
+                int(aggregated.get("actual", 0)),
+                batch_size=state.batch_size or service.default_batch_size,
+            )
+        )
+        lines.append(f"Оценочное время: ≈ {estimated}.")
+        lines.append(f"Режим: {'все аккаунты' if state.account_mode == AccountMode.ALL else 'один аккаунт'}.")
+
         interval_seconds = state.user_interval_seconds or 0
         normalized_interval = state.user_interval_text or format_interval_hms(interval_seconds)
         if interval_seconds > 0:
             humanized_interval = service.humanize_interval(interval_seconds)
-            interval_line = f"Интервал между циклами: {normalized_interval} ({humanized_interval})"
+            lines.append(f"Интервал между циклами: {normalized_interval} ({humanized_interval}).")
         else:
-            interval_line = f"Интервал между циклами: {normalized_interval}"
-        return (
-            "Проверьте параметры авторассылки:\n"
-            f"Режим: {'все аккаунты' if state.account_mode == AccountMode.ALL else 'один аккаунт'}\n"
-            f"Аккаунты: {account_line}\n"
-            f"{interval_line}\n"
-            f"Уведомления: {notify_line}\n\n"
-            "Нажмите 'Создать', чтобы запустить авторассылку."
-        )
+            lines.append(f"Интервал между циклами: {normalized_interval}.")
+
+        notify_line = "Включены" if state.notify_each_cycle else "Выключены"
+        lines.append(f"Уведомления: {notify_line}.")
+        lines.extend(["", "Готовы начать?", "Нажмите 'Создать', чтобы запустить авторассылку."])
+        return "\n".join(lines)
 
     async def _update_confirmation_message(event: CallbackQuery.Event, state: AutoTaskSetupState) -> None:
         text = _render_confirmation_text(state)
@@ -640,21 +934,39 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         if mode == AccountMode.SINGLE:
             buttons = []
             for account_id in state.available_account_ids:
-                count = state.per_account_group_counts.get(account_id, 0)
                 label_name = state.account_labels.get(account_id, account_id)
-                label = f"{label_name} ({count} групп)"
+                stats = state.account_group_stats.get(account_id, {}) if isinstance(state.account_group_stats, Mapping) else {}
+                actual_count = _coerce_positive_int(stats.get("actual_target_groups") or stats.get("actual_targets"), default=0)
+                rows_total = _coerce_positive_int(stats.get("rows_in_file") or stats.get("file_rows"), default=0)
+                unique_total = _coerce_positive_int(stats.get("unique_entries_in_file") or stats.get("unique_groups"), default=0)
+                label_parts = [f"{actual_count} уникальных чатов"]
+                if rows_total:
+                    label_parts.append(f"{rows_total} строк")
+                elif unique_total:
+                    label_parts.append(f"{unique_total} уникальных записей")
+                label_stats = ", ".join(label_parts)
+                label = f"{label_name} ({label_stats})"
                 buttons.append([Button.inline(label, f"{SELECT_CALLBACK}:{account_id}".encode("utf-8"))])
             buttons.append([Button.inline("Отмена", f"{CANCEL_CALLBACK}:accounts".encode("utf-8"))])
             message = await event.edit("Выберите аккаунт для авторассылки:", buttons=buttons)
             state_manager.update(event.sender_id, step=AutoTaskSetupStep.CHOOSING_ACCOUNT, last_message_id=message.id)
         else:
             minimum = _minimum_seconds_for_state(event.sender_id, state)
-            text = (
-                "Вы выбрали режим для всех аккаунтов.\n"
-                f"Всего аккаунтов: {len(state.available_account_ids)}\n"
-                f"Минимальный интервал: {service.humanize_interval(minimum)}\n\n"
-                f"{INTERVAL_HELP}"
+            stats_map = state.account_group_stats if isinstance(state.account_group_stats, Mapping) else {}
+            aggregated = _aggregate_account_stats(state.available_account_ids, stats_map)
+            stats_lines = _build_stats_lines(
+                int(aggregated.get("actual", 0)),
+                int(aggregated.get("rows", 0)),
+                int(aggregated.get("unique", 0)),
             )
+            text_lines = list(stats_lines)
+            text_lines.append(f"Выбрано аккаунтов: {len(state.available_account_ids)}.")
+            text_lines.append(
+                _describe_materials_line(bool(aggregated.get("has_text")), bool(aggregated.get("has_image")))
+            )
+            text_lines.append(f"Минимальный интервал: {service.humanize_interval(minimum)}")
+            text_lines.extend(["", INTERVAL_HELP])
+            text = "\n".join(text_lines)
             message = await event.edit(text, buttons=[[Button.inline("Отмена", f"{CANCEL_CALLBACK}:interval".encode("utf-8"))]])
             state_manager.update(event.sender_id, step=AutoTaskSetupStep.ENTERING_INTERVAL, last_message_id=message.id)
 
@@ -674,11 +986,21 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
         state_manager.update(event.sender_id, selected_account_id=session_id)
         minimum = _minimum_seconds_for_state(event.sender_id, state_manager.get(event.sender_id))
         label_name = state.account_labels.get(session_id, session_id)
-        text = (
-            f"Выбран аккаунт {label_name}.\n"
-            f"Минимальный интервал: {service.humanize_interval(minimum)}\n\n"
-            f"{INTERVAL_HELP}"
+        stats_map = state.account_group_stats if isinstance(state.account_group_stats, Mapping) else {}
+        aggregated = _aggregate_account_stats([session_id], stats_map)
+        stats_lines = _build_stats_lines(
+            int(aggregated.get("actual", 0)),
+            int(aggregated.get("rows", 0)),
+            int(aggregated.get("unique", 0)),
         )
+        summary_lines = list(stats_lines)
+        summary_lines.append(f"Выбранный аккаунт: {label_name}.")
+        summary_lines.append(
+            _describe_materials_line(bool(aggregated.get("has_text")), bool(aggregated.get("has_image")))
+        )
+        summary_lines.append(f"Минимальный интервал: {service.humanize_interval(minimum)}")
+        summary_lines.extend(["", INTERVAL_HELP])
+        text = "\n".join(summary_lines)
         message = await event.edit(text, buttons=[[Button.inline("Отмена", f"{CANCEL_CALLBACK}:interval".encode("utf-8"))]])
         state_manager.update(event.sender_id, step=AutoTaskSetupStep.ENTERING_INTERVAL, last_message_id=message.id)
 

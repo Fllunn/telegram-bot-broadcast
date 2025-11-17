@@ -34,6 +34,7 @@ from src.services.broadcast_shared import (
     describe_content_payload,
     render_group_label,
     resolve_group_targets,
+    resolved_target_identity,
     send_payload_to_group,
 )
 from src.services.telethon_manager import TelethonSessionManager
@@ -522,6 +523,7 @@ class AutoBroadcastRunner:
         account_label = session.display_name()
         session_inactive = False
         last_health_check = 0.0
+        delivered_peer_keys: Set[tuple[str, object | tuple]] = set()
 
         async def _ensure_account_active(force: bool = False) -> bool:
             nonlocal last_health_check, session_inactive
@@ -643,6 +645,23 @@ class AutoBroadcastRunner:
                 for target_index, target in enumerate(targets):
                     if self._stop_event.is_set() or session_inactive:
                         break
+
+                    identity = resolved_target_identity(target)
+                    if identity in delivered_peer_keys:
+                        logger.info(
+                            "Auto broadcast duplicate target skipped",
+                            extra={
+                                "event_type": "auto_broadcast_duplicate_skip",
+                                "task_id": self._task_id,
+                                "user_id": session.owner_id,
+                                "account_id": session.session_id,
+                                "group_label": target.label,
+                                "identity": repr(identity),
+                            },
+                        )
+                        continue
+
+                    delivered_peer_keys.add(identity)
 
                     payload_text = text
                     success, reason = await send_payload_to_group(
@@ -773,7 +792,21 @@ class AutoBroadcastRunner:
         await asyncio.sleep(0)  # allow calling context to proceed
         session_list = list(sessions)
         labels = ", ".join(session.display_name() for session in session_list)
-        groups_total = sum(len(self._groups_for_session(task, session.session_id)) for session in session_list)
+        metadata_map = task.metadata if isinstance(task.metadata, Mapping) else {}
+        actual_map = metadata_map.get("per_account_actual_targets") if isinstance(metadata_map, Mapping) else None
+        groups_total = 0
+        if isinstance(actual_map, Mapping):
+            for session in session_list:
+                value = actual_map.get(session.session_id)
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    count = None
+                if count is None or count <= 0:
+                    count = len(self._groups_for_session(task, session.session_id))
+                groups_total += max(0, count)
+        else:
+            groups_total = sum(len(self._groups_for_session(task, session.session_id)) for session in session_list)
         expected_seconds = max(1, groups_total) * BROADCAST_DELAY_MAX_SECONDS
         text = (
             "🚀 Новый цикл автосообщений запущен.\n"

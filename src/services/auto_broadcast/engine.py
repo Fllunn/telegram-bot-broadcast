@@ -19,6 +19,7 @@ from src.services.auto_broadcast.supervisor import AutoBroadcastSupervisor
 from src.services.auto_broadcast.payloads import extract_image_metadata
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.account_status import AccountStatusService
+from src.services.broadcast_shared import deduplicate_broadcast_groups
 
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,25 @@ class AutoBroadcastService:
         account_ids = [session.session_id for session in sessions]
         primary_account = account_ids[0] if account_mode == AccountMode.SINGLE else None
 
+        per_account_actual_targets: Dict[str, int] = {}
+        for session in sessions:
+            metadata = session.metadata or {}
+            mapping = metadata if isinstance(metadata, Mapping) else {}
+            stats_payload = mapping.get("broadcast_groups_stats") if isinstance(mapping, Mapping) else None
+            actual = None
+            if isinstance(stats_payload, Mapping):
+                actual = stats_payload.get("actual_targets")
+            actual_value = None
+            if actual is not None:
+                try:
+                    actual_value = int(actual)
+                except (TypeError, ValueError):
+                    actual_value = None
+            if actual_value is None or actual_value <= 0:
+                account_groups_list = groups_by_account.get(session.session_id) or []
+                actual_value = len(account_groups_list)
+            per_account_actual_targets[session.session_id] = max(0, actual_value)
+
         task = AutoBroadcastTask(
             task_id=self._generate_task_id(),
             user_id=user_id,
@@ -251,6 +271,9 @@ class AutoBroadcastService:
             next_run_ts=datetime.utcnow(),
             notify_each_cycle=notify_each_cycle,
             batch_size=batch_size,
+            metadata={
+                "per_account_actual_targets": per_account_actual_targets,
+            },
         )
 
         stored = await self._tasks.create_task(task)
@@ -452,6 +475,29 @@ class AutoBroadcastService:
                 extra={"raw_length": len(container)},
             )
         return targets
+
+    @staticmethod
+    def _metadata_groups(metadata: Mapping[str, Any]) -> List[dict[str, Any]]:
+        if not isinstance(metadata, Mapping):
+            return []
+        unique_source = metadata.get("broadcast_groups_unique")
+        if isinstance(unique_source, list) and unique_source:
+            prepared: List[dict[str, Any]] = []
+            for entry in unique_source:
+                if isinstance(entry, Mapping):
+                    prepared.append(dict(entry))
+            if prepared:
+                return prepared
+        raw_source = metadata.get("broadcast_groups")
+        raw_groups: List[Mapping[str, Any]] = []
+        if isinstance(raw_source, list) and raw_source:
+            for entry in raw_source:
+                if isinstance(entry, Mapping):
+                    raw_groups.append(entry)
+        if not raw_groups:
+            return []
+        deduplicated = deduplicate_broadcast_groups(raw_groups)
+        return [dict(entry) for entry in deduplicated]
 
     @staticmethod
     def _normalize_chat_id(value: Any) -> Optional[int]:
@@ -764,11 +810,10 @@ class AutoBroadcastService:
         result: Dict[str, List[GroupTarget]] = {}
         for session in sessions:
             metadata = session.metadata or {}
-            raw_groups = metadata.get("broadcast_groups") if isinstance(metadata, Mapping) else None
-            if not isinstance(raw_groups, list):
-                raw_groups = []
+            metadata_mapping: Mapping[str, Any] = metadata if isinstance(metadata, Mapping) else {}
+            group_payloads = self._metadata_groups(metadata_mapping)
             prepared: List[GroupTarget] = []
-            for target in self.build_group_targets(raw_groups):
+            for target in self.build_group_targets(group_payloads):
                 if isinstance(target.metadata, Mapping) and target.metadata.get("is_member") is False:
                     logger.debug(
                         "Skipping group marked as inaccessible",
@@ -781,6 +826,15 @@ class AutoBroadcastService:
                     continue
                 if self._is_valid_group(target):
                     prepared.append(target)
+            if group_payloads and not prepared:
+                logger.debug(
+                    "Metadata provided broadcast groups but none validated",
+                    extra={
+                        "session_id": session.session_id,
+                        "user_id": session.owner_id,
+                        "groups_provided": len(group_payloads),
+                    },
+                )
             for target in prepared:
                 target.source_session_id = session.session_id
             result[session.session_id] = prepared

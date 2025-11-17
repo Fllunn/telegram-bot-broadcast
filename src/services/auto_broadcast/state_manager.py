@@ -28,6 +28,7 @@ class AutoTaskSetupState:
     per_account_group_counts: Dict[str, int] = field(default_factory=dict)
     account_labels: Dict[str, str] = field(default_factory=dict)
     account_groups: Dict[str, List[object]] = field(default_factory=dict)
+    account_group_stats: Dict[str, Dict[str, object]] = field(default_factory=dict)
     total_groups: int = 0
     user_interval_seconds: Optional[float] = None
     user_interval_text: Optional[str] = None
@@ -58,6 +59,7 @@ class AutoTaskStateManager:
         per_account_group_counts: Optional[Dict[str, int]] = None,
         account_labels: Optional[Dict[str, str]] = None,
         account_groups: Optional[Dict[str, List[object]]] = None,
+        account_group_stats: Optional[Dict[str, Dict[str, object]]] = None,
         total_groups: int = 0,
         last_message_id: Optional[int] = None,
     ) -> AutoTaskSetupState:
@@ -68,6 +70,7 @@ class AutoTaskStateManager:
             per_account_group_counts=dict(per_account_group_counts or {}),
             account_labels=dict(account_labels or {}),
             account_groups=dict(account_groups or {}),
+            account_group_stats=dict(account_group_stats or {}),
             total_groups=total_groups,
             last_message_id=last_message_id,
         )
