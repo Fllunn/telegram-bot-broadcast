@@ -1580,7 +1580,7 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 
 		previous_state = context.broadcast_manager.clear(user_id)
 		if previous_state and previous_state.step != BroadcastStep.IDLE:
-			logger.info(
+			logger.debug(
 				"Прерван незавершённый поток настройки рассылки",
 				extra={"user_id": user_id, "flow": previous_state.flow.value, "step": previous_state.step.value},
 			)
@@ -1598,7 +1598,7 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			step=BroadcastStep.CHOOSING_SCOPE,
 			last_message_id=event.id,
 		)
-		logger.info(
+		logger.debug(
 			"Пользователь %s начал настройку %s для рассылки",
 			user_id,
 			config.log_started_subject,
@@ -2246,7 +2246,7 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 		user_id = event.sender_id
 		previous_state = context.broadcast_manager.clear(user_id)
 		if previous_state and previous_state.step != BroadcastStep.IDLE:
-			logger.info(
+			logger.debug(
 				"Пользователь переключился на просмотр материалов во время настройки",
 				extra={"user_id": user_id, "flow": previous_state.flow.value, "step": previous_state.step.value},
 			)
@@ -2536,7 +2536,7 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			return
 
 		context.broadcast_manager.clear(user_id)
-		logger.info(
+		logger.debug(
 			"Пользователь %s сохранил %s для %s аккаунтов",
 			user_id,
 			config.log_saved_subject,
@@ -2643,7 +2643,7 @@ def setup_broadcast_commands(client, context: BotContext) -> None:
 			return
 
 		context.broadcast_manager.clear(user_id)
-		logger.info(
+		logger.debug(
 			"Пользователь %s сохранил %s для %s аккаунтов",
 			user_id,
 			config.log_saved_subject,

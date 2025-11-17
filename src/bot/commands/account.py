@@ -349,13 +349,22 @@ async def _finalize_login(
     if is_new_account:
         message = f"✅ Аккаунт успешно подключен: {display_name} ({handle})"
         logger.info(
-            "Пользователь %s успешно авторизовал аккаунт", user_id, extra={"owner_id": user_id, "account_id": me.id}
+            "Аккаунт авторизован",
+            extra={
+                "user_id": user_id,
+                "account_id": me.id,
+                "account_display": display_name,
+            },
         )
     else:
         account_ref = f"@{me.username}" if me.username else display_name
         message = f"Вы уже вошли в аккаунт {account_ref}.\nИспользуйте /accounts для управления."
-        logger.info(
-            "Пользователь %s повторно авторизовал аккаунт", user_id, extra={"owner_id": user_id, "account_id": me.id}
+        logger.debug(
+            "Повторная авторизация выполнена",
+            extra={
+                "user_id": user_id,
+                "account_id": me.id,
+            },
         )
 
     await send_message(message, build_main_menu_keyboard())
@@ -499,7 +508,7 @@ def setup_account_commands(client, context: BotContext) -> None:
             intro = f"У вас уже подключены аккаунты:\n{body}\n\n"
 
         context.auth_manager.begin(user_id, step=AuthStep.WAITING_PHONE, last_message_id=event.id)
-        logger.info("Запущен процесс авторизации по номеру для пользователя %s", user_id)
+        logger.debug("Запущен процесс авторизации по номеру", extra={"user_id": user_id})
         await event.respond(
             f"{intro}Введите ваш номер телефона (в формате +79998887766):",
             buttons=_build_single_button(CANCEL_LABEL),
@@ -562,7 +571,7 @@ def setup_account_commands(client, context: BotContext) -> None:
         context.auth_manager.update(user_id, last_message_id=message.id)
         task = asyncio.create_task(_wait_for_qr_authorization(client, context, user_id))
         context.auth_manager.update(user_id, qr_task=task)
-        logger.info("Запущен процесс авторизации по QR для пользователя %s", user_id)
+        logger.debug("Запущен процесс авторизации по QR", extra={"user_id": user_id})
 
     @client.on(events.NewMessage(incoming=True, func=_expect_step(context, AuthStep.WAITING_PHONE)))
     async def handle_phone_number(event: NewMessage.Event) -> None:

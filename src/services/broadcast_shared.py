@@ -15,6 +15,11 @@ from telethon.errors.rpcerrorlist import ChatWriteForbiddenError, FileReferenceE
 
 logger = logging.getLogger(__name__)
 
+_KEY_INFO_PREFIXES: tuple[str, ...] = (
+    "Рассылка запущена",
+    "Рассылка завершена",
+)
+
 
 class DialogsFetchError(RuntimeError):
     """Raised when dialogs cannot be fetched for a given account."""
@@ -262,6 +267,8 @@ async def collect_unique_target_peer_keys(
 
 
 def log_broadcast_event(level: int, message: str, **details: Any) -> None:
+    if level == logging.INFO and not _should_keep_info_message(message):
+        level = logging.DEBUG
     formatted_extra = {f"broadcast_{key}": value for key, value in details.items()}
     try:
         loop = asyncio.get_running_loop()
@@ -269,6 +276,12 @@ def log_broadcast_event(level: int, message: str, **details: Any) -> None:
         logger.log(level, message, extra=formatted_extra)
     else:
         loop.call_soon(partial(logger.log, level, message, extra=formatted_extra))
+
+
+def _should_keep_info_message(message: object) -> bool:
+    if not isinstance(message, str):
+        return False
+    return any(message.startswith(prefix) for prefix in _KEY_INFO_PREFIXES)
 
 
 def render_group_label(group: Mapping[str, object]) -> str:

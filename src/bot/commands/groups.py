@@ -636,7 +636,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         user_id = event.sender_id
         existing_upload = upload_manager.get(user_id)
         if existing_upload and existing_upload.step != GroupUploadStep.IDLE:
-            logger.info(
+            logger.debug(
                 "Сбрасываем незавершённую загрузку групп",
                 extra={"user_id": user_id, "step": existing_upload.step.value},
             )
@@ -1132,12 +1132,14 @@ def setup_group_commands(client, context: BotContext) -> None:
             except (TypeError, ValueError):
                 total_actual_targets += len(unique_groups)
         logger.info(
-            "Пользователь %s загрузил список групп (scope=%s, rows=%s, unique=%s, actual=%s)",
-            user_id,
-            state.scope.value,
-            len(enriched_groups),
-            len(unique_groups),
-            total_actual_targets,
+            "Список групп обновлён",
+            extra={
+                "user_id": user_id,
+                "scope": state.scope.value,
+                "rows_total": len(enriched_groups),
+                "groups_unique": len(unique_groups),
+                "targets_actual": total_actual_targets,
+            },
         )
 
         upload_manager.neutralize(user_id)
@@ -1152,7 +1154,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         user_id = event.sender_id
         existing_view = view_manager.get(user_id)
         if existing_view and existing_view.step != GroupViewStep.IDLE:
-            logger.info(
+            logger.debug(
                 "Сбрасываем незавершённый просмотр групп",
                 extra={"user_id": user_id, "step": existing_view.step.value},
             )

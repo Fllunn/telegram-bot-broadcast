@@ -285,7 +285,7 @@ class AutoBroadcastService:
                 metadata=session.metadata,
             )
         self._supervisor.request_refresh()
-        logger.info("Auto broadcast task created", extra={"task_id": stored.task_id, "user_id": user_id})
+        logger.debug("Auto broadcast task created", extra={"task_id": stored.task_id, "user_id": user_id})
         return stored
 
     async def load_active_sessions(self, user_id: int, *, ensure_fresh_metadata: bool = False) -> List[TelethonSession]:
@@ -451,7 +451,7 @@ class AutoBroadcastService:
                 return []
 
         if not container:
-            logger.info("Received empty broadcast group list; nothing to build")
+            logger.debug("Received empty broadcast group list; nothing to build")
             return []
 
         targets: List[GroupTarget] = []

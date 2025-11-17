@@ -6,8 +6,9 @@ import logging
 import math
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from telethon import TelegramClient
 from telethon.errors.rpcerrorlist import (
@@ -55,6 +56,18 @@ AUTH_ERRORS: Tuple[type[BaseException], ...] = (
 )
 
 
+@dataclass(slots=True)
+class AccountCycleStats:
+    account_id: str
+    groups_planned: int
+    expected_targets: int = 0
+    attempts: int = 0
+    sent: int = 0
+    failed: int = 0
+    skipped_duplicates: int = 0
+    retried: bool = False
+
+
 class AutoBroadcastRunner:
     """Executes periodic broadcast cycles for a single task."""
 
@@ -97,7 +110,7 @@ class AutoBroadcastRunner:
         self._stop_event.set()
 
     async def run(self) -> None:
-        logger.info("Auto broadcast runner started", extra={"task_id": self._task_id})
+        logger.debug("Auto broadcast runner started", extra={"task_id": self._task_id})
         try:
             while not self._stop_event.is_set():
                 task = await self._tasks.get_by_task_id(self._task_id)
@@ -105,7 +118,7 @@ class AutoBroadcastRunner:
                     logger.warning("Auto broadcast task removed during execution", extra={"task_id": self._task_id})
                     return
                 if not task.enabled or task.status != TaskStatus.RUNNING:
-                    logger.info(
+                    logger.debug(
                         "Runner stopped because task status is %s", task.status.value, extra={"task_id": self._task_id}
                     )
                     return
@@ -130,7 +143,7 @@ class AutoBroadcastRunner:
 
                 await self._delayed_wait(1.0)
         finally:
-            logger.info("Auto broadcast runner stopped", extra={"task_id": self._task_id})
+            logger.debug("Auto broadcast runner stopped", extra={"task_id": self._task_id})
 
     async def _delayed_wait(self, seconds: float) -> None:
         try:
@@ -165,10 +178,7 @@ class AutoBroadcastRunner:
     async def _execute_cycle(self, task: AutoBroadcastTask) -> None:
         logger.info("Starting auto broadcast cycle", extra={"task_id": task.task_id, "user_id": task.user_id})
         cycle_started = time.monotonic()
-        total_sent = 0
-        total_failed = 0
         self._last_lock_refresh = time.monotonic()
-        global_delivered_peer_keys: Set[tuple[str, object | tuple]] = set()
 
         sessions = await self._resolve_sessions(task)
         if not sessions:
@@ -178,13 +188,36 @@ class AutoBroadcastRunner:
         if task.account_mode == AccountMode.ALL:
             SHUFFLE_RANDOM.shuffle(sessions)
 
+        account_groups: Dict[str, List[GroupTarget]] = {}
+        per_account_target_counts: Dict[str, int] = {}
+        for session in sessions:
+            groups = list(self._groups_for_session(task, session.session_id))
+            account_groups[session.session_id] = groups
+            per_account_target_counts[session.session_id] = len(groups)
+
+        logger.debug(
+            "Planned per-account targets",
+            extra={
+                "task_id": task.task_id,
+                "user_id": task.user_id,
+                "per_account": per_account_target_counts,
+            },
+        )
+
         resume_account_id = task.current_account_id
         resume_batch_index = task.current_batch_index
         resume_group_index = task.current_group_index
         if resume_account_id:
             sessions = self._rotate_sessions_for_resume(sessions, resume_account_id)
 
-        notify_task = asyncio.create_task(self._notify_cycle_start(task, sessions)) if task.notify_each_cycle else None
+        notify_task: Optional[asyncio.Task] = None
+        if task.notify_each_cycle:
+            notify_task = asyncio.create_task(
+                self._notify_cycle_start(task, sessions, per_account_target_counts)
+            )
+
+        per_account_stats: Dict[str, AccountCycleStats] = {}
+        pending_retries: List[Tuple[TelethonSession, List[GroupTarget], int]] = []
 
         try:
             for account_index, session in enumerate(sessions):
@@ -210,20 +243,33 @@ class AutoBroadcastRunner:
                     group_index=group_index,
                 )
 
+                planned_groups = account_groups.get(session.session_id, [])
+                logger.debug(
+                    "Auto broadcast account run starting",
+                    extra={
+                        "task_id": self._task_id,
+                        "user_id": session.owner_id,
+                        "account_id": session.session_id,
+                        "groups_planned": len(planned_groups),
+                        "resume_batch": batch_index,
+                        "resume_group": group_index,
+                        "retry": False,
+                    },
+                )
+
                 try:
-                    sent, failed = await self._process_account(
+                    stats = await self._process_account(
                         task,
                         session,
+                        planned_groups,
                         account_index=account_index,
                         resume_batch_index=batch_index,
                         resume_group_index=group_index,
-                        delivered_peer_keys=global_delivered_peer_keys,
+                        is_retry=False,
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    sent = 0
-                    failed = 1
                     logger.exception(
                         "Auto broadcast account processing failed",
                         extra={
@@ -239,14 +285,134 @@ class AutoBroadcastRunner:
                         reason=f"unexpected_error: {exc.__class__.__name__}",
                         task=task,
                     )
+                    stats = AccountCycleStats(
+                        account_id=session.session_id,
+                        groups_planned=len(planned_groups),
+                        expected_targets=len(planned_groups),
+                        sent=0,
+                        failed=1,
+                        attempts=0,
+                    )
 
-                total_sent += sent
-                total_failed += failed
+                per_account_stats[session.session_id] = stats
+
+                logger.debug(
+                    "Auto broadcast account run finished",
+                    extra={
+                        "task_id": self._task_id,
+                        "user_id": session.owner_id,
+                        "account_id": session.session_id,
+                        "sent": stats.sent,
+                        "failed": stats.failed,
+                        "attempts": stats.attempts,
+                        "expected_targets": stats.expected_targets,
+                        "skipped_duplicates": stats.skipped_duplicates,
+                        "retry": False,
+                    },
+                )
+
+                if (
+                    not self._stop_event.is_set()
+                    and stats.groups_planned > 0
+                    and stats.expected_targets > 0
+                    and stats.attempts == 0
+                ):
+                    pending_retries.append((session, planned_groups, account_index))
+                    logger.warning(
+                        "Detected account run with zero attempts",
+                        extra={
+                            "task_id": self._task_id,
+                            "user_id": session.owner_id,
+                            "account_id": session.session_id,
+                            "groups_planned": len(planned_groups),
+                        },
+                    )
 
                 await self._tasks.reset_progress(task.task_id)
 
                 if self._stop_event.is_set():
                     break
+
+            if pending_retries and not self._stop_event.is_set():
+                retry_account_ids = [session.session_id for session, _groups, _ in pending_retries]
+                logger.warning(
+                    "Retrying account runs with no activity",
+                    extra={
+                        "task_id": self._task_id,
+                        "accounts": retry_account_ids,
+                    },
+                )
+                for session, planned_groups, account_index in pending_retries:
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        retry_stats = await self._process_account(
+                            task,
+                            session,
+                            planned_groups,
+                            account_index=account_index,
+                            resume_batch_index=0,
+                            resume_group_index=0,
+                            is_retry=True,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Retry run failed",
+                            extra={
+                                "task_id": self._task_id,
+                                "user_id": session.owner_id,
+                                "account_id": session.session_id,
+                            },
+                        )
+                        await self._tasks.add_problem_account(self._task_id, session.session_id)
+                        continue
+
+                    retry_stats.retried = True
+                    existing = per_account_stats.get(session.session_id)
+                    if existing:
+                        existing.sent += retry_stats.sent
+                        existing.failed += retry_stats.failed
+                        existing.attempts += retry_stats.attempts
+                        existing.skipped_duplicates += retry_stats.skipped_duplicates
+                        existing.expected_targets = max(
+                            existing.expected_targets,
+                            retry_stats.expected_targets,
+                        )
+                        existing.retried = True
+                    else:
+                        per_account_stats[session.session_id] = retry_stats
+
+                    logger.debug(
+                        "Auto broadcast account retry finished",
+                        extra={
+                            "task_id": self._task_id,
+                            "user_id": session.owner_id,
+                            "account_id": session.session_id,
+                            "sent": retry_stats.sent,
+                            "failed": retry_stats.failed,
+                            "attempts": retry_stats.attempts,
+                            "expected_targets": retry_stats.expected_targets,
+                            "skipped_duplicates": retry_stats.skipped_duplicates,
+                            "retry": True,
+                        },
+                    )
+
+                    await self._tasks.reset_progress(task.task_id)
+
+                    combined = per_account_stats[session.session_id]
+                    if combined.expected_targets > 0 and combined.attempts == 0:
+                        logger.warning(
+                            "Account remained inactive after retry",
+                            extra={
+                                "task_id": self._task_id,
+                                "user_id": session.owner_id,
+                                "account_id": session.session_id,
+                                "groups_planned": combined.groups_planned,
+                            },
+                        )
+                        await self._tasks.add_problem_account(self._task_id, session.session_id)
         finally:
             if notify_task and not notify_task.done():
                 notify_task.cancel()
@@ -255,7 +421,11 @@ class AutoBroadcastRunner:
 
         cycle_finished = time.monotonic()
         actual_cycle_seconds = max(0.1, cycle_finished - cycle_started)
-        base_interval = task.user_interval_seconds if math.isfinite(task.user_interval_seconds) and task.user_interval_seconds > 0 else self._interval_margin
+        base_interval = (
+            task.user_interval_seconds
+            if math.isfinite(task.user_interval_seconds) and task.user_interval_seconds > 0
+            else self._interval_margin
+        )
         jitter_percent = random.uniform(0.05, 0.10)
         lower = max(self._interval_margin, base_interval * (1.0 - jitter_percent))
         upper = max(lower + 1.0, base_interval * (1.0 + jitter_percent))
@@ -264,6 +434,36 @@ class AutoBroadcastRunner:
         if chosen_interval < minimal_gap:
             chosen_interval = minimal_gap
         next_run_ts = datetime.utcnow() + timedelta(seconds=chosen_interval)
+
+        total_sent = sum(stat.sent for stat in per_account_stats.values())
+        total_failed = sum(stat.failed for stat in per_account_stats.values())
+        total_expected = sum(stat.expected_targets for stat in per_account_stats.values())
+        total_attempts = sum(stat.attempts for stat in per_account_stats.values())
+        per_account_summary = {
+            account_id: {
+                "groups_planned": stats.groups_planned,
+                "expected_targets": stats.expected_targets,
+                "attempts": stats.attempts,
+                "sent": stats.sent,
+                "failed": stats.failed,
+                "skipped_duplicates": stats.skipped_duplicates,
+                "retried": stats.retried,
+            }
+            for account_id, stats in per_account_stats.items()
+        }
+
+        logger.info(
+            "Auto broadcast cycle summary",
+            extra={
+                "task_id": task.task_id,
+                "user_id": task.user_id,
+                "sent": total_sent,
+                "failed": total_failed,
+                "expected_targets": total_expected,
+                "attempts": total_attempts,
+                "per_account": per_account_summary,
+            },
+        )
 
         updated_task = await self._tasks.record_cycle_result(
             task.task_id,
@@ -492,7 +692,7 @@ class AutoBroadcastRunner:
             return False
         if state.status == AccountStatus.COOLDOWN and state.cooldown_until:
             if state.cooldown_until > datetime.utcnow():
-                logger.info(
+                logger.debug(
                     "Account %s is on cooldown until %s",
                     session.session_id,
                     state.cooldown_until,
@@ -514,20 +714,27 @@ class AutoBroadcastRunner:
         self,
         task: AutoBroadcastTask,
         session: TelethonSession,
+        groups: List[GroupTarget],
         *,
         account_index: int,
         resume_batch_index: int,
         resume_group_index: int,
-        delivered_peer_keys: Set[tuple[str, object | tuple]],
-    ) -> Tuple[int, int]:
+        is_retry: bool,
+    ) -> AccountCycleStats:
         self._clear_inactive_marker(session.session_id)
+        stats = AccountCycleStats(
+            account_id=session.session_id,
+            groups_planned=len(groups),
+            expected_targets=len(groups),
+        )
+
         client: Optional[TelegramClient] = None
         try:
             client = await self._session_manager.build_client_from_session(session)
         except Exception as exc:
             logger.exception(
                 "Failed to build Telethon client",
-                extra={"task_id": task.task_id, "account_id": session.session_id},
+                extra={"task_id": task.task_id, "account_id": session.session_id, "retry": is_retry},
             )
             await self._notify_account_inactive(
                 session_id=session.session_id,
@@ -536,10 +743,8 @@ class AutoBroadcastRunner:
                 reason=f"ошибка восстановления сессии: {exc.__class__.__name__}",
                 task=task,
             )
-            return 0, 0
+            return stats
 
-        sent = 0
-        failed = 0
         dialogs_cache: dict[str, list[object]] = {}
         batch_size = max(1, task.batch_size)
         resume_index = max(0, resume_batch_index * batch_size + resume_group_index)
@@ -548,6 +753,8 @@ class AutoBroadcastRunner:
         session_inactive = False
         last_health_check = 0.0
         is_secondary_account = account_index >= 1
+        delivered_peer_keys: Set[tuple[str, object | tuple]] = set()
+        observed_targets: Set[tuple[str, object | tuple]] = set()
 
         async def _ensure_account_active(force: bool = False) -> bool:
             nonlocal last_health_check, session_inactive
@@ -580,15 +787,14 @@ class AutoBroadcastRunner:
                     extra={"task_id": task.task_id, "account_id": session.session_id},
                 )
                 self._stop_event.set()
-                return sent, failed
+                return stats
 
-            groups = self._groups_for_session(task, session.session_id)
             if not groups:
                 logger.warning(
                     "No groups configured for account",
                     extra={"task_id": task.task_id, "account_id": session.session_id},
                 )
-                return sent, failed
+                return stats
 
             text, image_data = self._prepare_materials(session)
             if not text and image_data is None:
@@ -600,11 +806,11 @@ class AutoBroadcastRunner:
                     session.owner_id,
                     f"Аккаунт {session.display_name()} пропущен: нет текста или изображения для рассылки.",
                 )
-                return sent, failed
+                return stats
             content_description = describe_content_payload(bool(text), image_data is not None)
 
             if not await _ensure_account_active(force=True):
-                return sent, failed
+                return stats
 
             for index, group in enumerate(groups):
                 if index < resume_index:
@@ -613,14 +819,14 @@ class AutoBroadcastRunner:
                     break
                 if not await _ensure_account_active():
                     break
-                    if not await self._refresh_task_lock():
-                        logger.warning(
-                            "Auto broadcast lock lost mid-run",
-                            extra={"task_id": task.task_id, "account_id": session.session_id},
-                        )
-                        self._stop_event.set()
-                        session_inactive = True
-                        break
+                if not await self._refresh_task_lock():
+                    logger.warning(
+                        "Auto broadcast lock lost mid-run",
+                        extra={"task_id": task.task_id, "account_id": session.session_id},
+                    )
+                    self._stop_event.set()
+                    session_inactive = True
+                    break
 
                 group_payload: Mapping[str, object] = group.model_dump(mode="python", by_alias=True)
                 try:
@@ -641,7 +847,7 @@ class AutoBroadcastRunner:
                         reason=f"ошибка получения диалогов: {exc.error_type}",
                         task=task,
                     )
-                    return sent, failed
+                    return stats
                 except Exception as exc:
                     if self._is_auth_error(exc):
                         await self._notify_account_inactive(
@@ -651,8 +857,8 @@ class AutoBroadcastRunner:
                             reason=f"ошибка доступа к чатам: {exc.__class__.__name__}",
                             task=task,
                         )
-                        return sent, failed
-                    failed += 1
+                        return stats
+                    stats.failed += 1
                     await self._tasks.add_problem_account(self._task_id, session.session_id)
                     logger.exception(
                         "Auto broadcast: failed to resolve group",
@@ -668,7 +874,7 @@ class AutoBroadcastRunner:
                     continue
 
                 if not targets:
-                    failed += 1
+                    stats.failed += 1
                     await self._tasks.add_problem_account(self._task_id, session.session_id)
                     logger.warning(
                         "Auto broadcast: no accessible targets",
@@ -687,8 +893,11 @@ class AutoBroadcastRunner:
                         break
 
                     identity = resolved_target_identity(target)
+                    observed_targets.add(identity)
+
                     if identity in delivered_peer_keys:
-                        logger.info(
+                        stats.skipped_duplicates += 1
+                        logger.debug(
                             "Auto broadcast duplicate target skipped",
                             extra={
                                 "event_type": "auto_broadcast_duplicate_skip",
@@ -725,12 +934,14 @@ class AutoBroadcastRunner:
                         "account_id": session.session_id,
                         "group_label": target.label,
                         "reason": reason,
+                        "retry": is_retry,
                     }
 
+                    stats.attempts += 1
                     if success:
-                        sent += 1
+                        stats.sent += 1
                         log_payload["event_type"] = "auto_broadcast_message_sent"
-                        logger.info("Auto broadcast message sent", extra=log_payload)
+                        logger.debug("Auto broadcast message sent", extra=log_payload)
                     else:
                         if self._is_auth_error_reason(reason):
                             await self._notify_account_inactive(
@@ -740,8 +951,8 @@ class AutoBroadcastRunner:
                                 reason=f"ошибка отправки сообщения: {reason}",
                                 task=task,
                             )
-                            return sent, failed
-                        failed += 1
+                            return stats
+                        stats.failed += 1
                         await self._tasks.add_problem_account(self._task_id, session.session_id)
                         log_payload["event_type"] = "auto_broadcast_message_failed"
                         logger.warning("Auto broadcast message failed", extra=log_payload)
@@ -769,7 +980,7 @@ class AutoBroadcastRunner:
                 )
 
                 if duplicates_message:
-                    logger.info(
+                    logger.debug(
                         "Auto broadcast duplicates handled",
                         extra={
                             "event_type": "auto_broadcast_duplicates",
@@ -778,6 +989,7 @@ class AutoBroadcastRunner:
                             "account_id": session.session_id,
                             "group_label": render_group_label(group_payload),
                             "note": duplicates_message,
+                            "retry": is_retry,
                         },
                     )
 
@@ -786,7 +998,8 @@ class AutoBroadcastRunner:
         finally:
             if client is not None:
                 await self._session_manager.close_client(client)
-        return sent, failed
+        stats.expected_targets = max(stats.groups_planned, len(observed_targets))
+        return stats
 
     def _prepare_materials(self, session: TelethonSession) -> Tuple[Optional[str], Optional[BroadcastImageData]]:
         metadata = session.metadata or {}
@@ -845,25 +1058,38 @@ class AutoBroadcastRunner:
     def _random_secondary_account_delay() -> float:
         return random.uniform(SECONDARY_ACCOUNT_DELAY_MIN_SECONDS, SECONDARY_ACCOUNT_DELAY_MAX_SECONDS)
 
-    async def _notify_cycle_start(self, task: AutoBroadcastTask, sessions: Iterable[TelethonSession]) -> None:
+    async def _notify_cycle_start(
+        self,
+        task: AutoBroadcastTask,
+        sessions: Iterable[TelethonSession],
+        target_counts: Optional[Mapping[str, int]] = None,
+    ) -> None:
         await asyncio.sleep(0)  # allow calling context to proceed
         session_list = list(sessions)
         labels = ", ".join(session.display_name() for session in session_list)
         metadata_map = task.metadata if isinstance(task.metadata, Mapping) else {}
         actual_map = metadata_map.get("per_account_actual_targets") if isinstance(metadata_map, Mapping) else None
         groups_total = 0
-        if isinstance(actual_map, Mapping):
-            for session in session_list:
-                value = actual_map.get(session.session_id)
-                try:
-                    count = int(value)
-                except (TypeError, ValueError):
-                    count = None
-                if count is None or count <= 0:
-                    count = len(self._groups_for_session(task, session.session_id))
-                groups_total += max(0, count)
-        else:
-            groups_total = sum(len(self._groups_for_session(task, session.session_id)) for session in session_list)
+        for session in session_list:
+            count: Optional[int] = None
+            if target_counts is not None:
+                raw_planned = target_counts.get(session.session_id)
+                if raw_planned is not None:
+                    try:
+                        count = int(raw_planned)
+                    except (TypeError, ValueError):
+                        count = None
+            if count is None and isinstance(actual_map, Mapping):
+                raw_actual = actual_map.get(session.session_id)
+                if raw_actual is not None:
+                    try:
+                        count = int(raw_actual)
+                    except (TypeError, ValueError):
+                        count = None
+            if count is None or count <= 0:
+                count = len(self._groups_for_session(task, session.session_id))
+            groups_total += max(0, count)
+
         expected_seconds = max(1, groups_total) * BROADCAST_DELAY_MAX_SECONDS
         text = (
             "🚀 Новый цикл автосообщений запущен.\n"
@@ -880,6 +1106,7 @@ class AutoBroadcastRunner:
                 "accounts": labels,
                 "groups_total": groups_total,
                 "expected_duration_seconds": expected_seconds,
+                "target_counts": dict(target_counts or {}),
             },
         )
         await self._safe_notify_user(task.user_id, text)

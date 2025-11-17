@@ -82,7 +82,7 @@ class AutoBroadcastSupervisor:
             return
         self._stopped = False
         self._monitor_task = asyncio.create_task(self._monitor_loop())
-        logger.info("Auto broadcast supervisor started")
+        logger.debug("Auto broadcast supervisor started")
 
     async def stop(self) -> None:
         self._stopped = True
@@ -100,7 +100,7 @@ class AutoBroadcastSupervisor:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._monitor_task
             self._monitor_task = None
-        logger.info("Auto broadcast supervisor stopped")
+        logger.debug("Auto broadcast supervisor stopped")
 
     def request_refresh(self) -> None:
         self._wake_event.set()
@@ -191,7 +191,7 @@ class AutoBroadcastSupervisor:
         runner_task.add_done_callback(
             lambda fut, task_id=task.task_id: asyncio.create_task(self._handle_runner_completion(task_id, fut))
         )
-        logger.info("Launched auto broadcast runner", extra={"task_id": task.task_id, "user_id": task.user_id})
+        logger.debug("Launched auto broadcast runner", extra={"task_id": task.task_id, "user_id": task.user_id})
 
     async def _stop_runner(self, task_id: str) -> None:
         handle = self._handles.pop(task_id, None)
@@ -203,7 +203,7 @@ class AutoBroadcastSupervisor:
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await handle.task
-        logger.info("Stopped auto broadcast runner", extra={"task_id": task_id})
+        logger.debug("Stopped auto broadcast runner", extra={"task_id": task_id})
 
     async def _handle_runner_completion(self, task_id: str, future: asyncio.Future) -> None:
         handle = self._handles.get(task_id)
@@ -212,12 +212,12 @@ class AutoBroadcastSupervisor:
         if self._stopped:
             return
         if future.cancelled():
-            logger.info("Runner cancelled", extra={"task_id": task_id})
+            logger.debug("Runner cancelled", extra={"task_id": task_id})
             return
         exc = future.exception()
         if exc is None:
             handle.restart_attempts = 0
-            logger.info("Runner finished gracefully", extra={"task_id": task_id})
+            logger.debug("Runner finished gracefully", extra={"task_id": task_id})
             return
         handle.restart_attempts += 1
         logger.exception("Auto broadcast runner crashed", exc_info=exc, extra={"task_id": task_id})
@@ -231,7 +231,7 @@ class AutoBroadcastSupervisor:
         delay = min(self._base_backoff * (2 ** (handle.restart_attempts - 1)), self._max_backoff)
         handle.cancel_restart()
         handle.restart_task = asyncio.create_task(self._schedule_restart(task_id, delay))
-        logger.info("Scheduled runner restart", extra={"task_id": task_id, "delay": delay})
+        logger.debug("Scheduled runner restart", extra={"task_id": task_id, "delay": delay})
 
     async def _schedule_restart(self, task_id: str, delay: float) -> None:
         try:

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     auto_task_poll_interval_seconds: int = Field(default=15, alias="AUTO_TASK_POLL_INTERVAL")
     auto_task_lock_ttl_seconds: int = Field(default=180, alias="AUTO_TASK_LOCK_TTL")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_directory: str = Field(default="logs", alias="LOG_DIR")
     account_status_concurrency: int = Field(default=10, alias="ACCOUNT_STATUS_CONCURRENCY")
     account_status_timeout_seconds: float = Field(default=2.0, alias="ACCOUNT_STATUS_TIMEOUT_SECONDS")
     account_status_cache_ttl_seconds: float = Field(default=20.0, alias="ACCOUNT_STATUS_CACHE_TTL_SECONDS")

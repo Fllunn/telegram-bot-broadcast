@@ -111,7 +111,7 @@ async def _handle_cancel(event, *, context: BotContext, source: str) -> None:
     }
 
     snapshot = _state_snapshot(states)
-    logger.info(
+    logger.debug(
         "Получена глобальная отмена",
         extra={
             "user_id": user_id,

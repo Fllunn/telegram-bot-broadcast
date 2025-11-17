@@ -327,7 +327,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             if session_has_materials:
                 has_materials = True
             else:
-                logger.info(
+                logger.debug(
                     "Auto-task session skipped due to missing materials",
                     extra={
                         "user_id": event.sender_id,
