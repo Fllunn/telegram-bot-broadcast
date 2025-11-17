@@ -165,6 +165,26 @@ class AutoBroadcastTaskRepository:
             },
         )
 
+    async def refresh_lock(self, task_id: str, worker_id: str) -> Optional[AutoBroadcastTask]:
+        try:
+            document = await self._collection.find_one_and_update(
+                {"task_id": task_id, "locked_by": worker_id},
+                {
+                    "$set": {
+                        "lock_ts": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to refresh auto-task lock",
+                extra={"task_id": task_id, "worker_id": worker_id},
+            )
+            return None
+        return self._deserialize(document)
+
     async def update_status(self, task_id: str, *, status: TaskStatus, enabled: Optional[bool] = None) -> Optional[AutoBroadcastTask]:
         update: dict = {
             "status": status.value,

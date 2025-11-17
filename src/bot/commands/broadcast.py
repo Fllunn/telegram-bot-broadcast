@@ -7,7 +7,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence, Set
 
 from telethon import Button, events
@@ -51,6 +51,7 @@ from src.services.broadcast_shared import (
 	log_broadcast_event,
 	render_group_label,
 	resolve_group_targets,
+	resolved_target_identity,
 	send_payload_to_group,
 	sanitize_username_value,
 )
@@ -189,6 +190,7 @@ class SessionBroadcastPlan:
 	image_meta: Optional[Mapping[str, object]] = None
 	rows_total: int = 0
 	actual_target_count: int = 0
+	peer_keys: Set[tuple[str, object | tuple]] = field(default_factory=set)
 
 	def has_text(self) -> bool:
 		return bool(self.text and self.text.strip())
@@ -209,6 +211,7 @@ class BroadcastPlan:
 	total_groups: int
 	unique_groups_total: int
 	rows_total: int
+	peer_identities: Set[tuple[str, object | tuple]] = field(default_factory=set)
 
 	def has_text(self) -> bool:
 		return any(entry.has_text() for entry in self.sessions)
@@ -248,7 +251,57 @@ def _coerce_positive_int(value: object, *, default: int = 0) -> int:
 	return number if number > 0 else default
 
 
-async def _calculate_actual_target_count(
+def _fallback_peer_identity(group: Mapping[str, object]) -> tuple[str, object | tuple]:
+	chat_id_value = group.get("chat_id") if isinstance(group, Mapping) else None
+	chat_id: Optional[int] = None
+	if isinstance(chat_id_value, int):
+		chat_id = chat_id_value
+	elif isinstance(chat_id_value, str):
+		sanitized = chat_id_value.strip()
+		if sanitized.endswith(".0"):
+			sanitized = sanitized[:-2]
+		try:
+			chat_id = int(sanitized)
+		except (TypeError, ValueError):
+			chat_id = None
+	elif isinstance(chat_id_value, float) and chat_id_value.is_integer():
+		chat_id = int(chat_id_value)
+	if chat_id is not None:
+		return ("chat_id", chat_id)
+
+	username = _sanitize_username_value(group.get("username") if isinstance(group, Mapping) else None)
+	if username:
+		return ("username", username.casefold())
+
+	link_identifier = _extract_identifier_from_link_value(group.get("link") if isinstance(group, Mapping) else None)
+	if link_identifier:
+		return ("link", link_identifier.casefold())
+
+	raw_link = group.get("link") if isinstance(group, Mapping) else None
+	if isinstance(raw_link, str) and raw_link.strip():
+		return ("raw_link", raw_link.strip().casefold())
+
+	name_value = group.get("name") if isinstance(group, Mapping) else None
+	if isinstance(name_value, str) and name_value.strip():
+		return ("name", name_value.strip().casefold())
+
+	fallback_items: list[tuple[str, str]] = []
+	if isinstance(group, Mapping):
+		for key, value in group.items():
+			try:
+				key_text = str(key)
+			except Exception:
+				key_text = repr(key)
+			try:
+				value_text = str(value)
+			except Exception:
+				value_text = repr(value)
+			fallback_items.append((key_text, value_text))
+	fallback_items.sort()
+	return ("fallback", tuple(fallback_items))
+
+
+async def _calculate_actual_target_peers(
 	context: BotContext,
 	session: TelethonSession,
 	groups: Sequence[Mapping[str, object]],
@@ -256,9 +309,9 @@ async def _calculate_actual_target_count(
 	user_id: int,
 	account_label: str,
 	content_type: Optional[str],
-) -> int:
+) -> Set[tuple[str, object | tuple]]:
 	if not groups:
-		return 0
+		return set()
 	session_client = None
 	try:
 		session_client = await context.session_manager.build_client_from_session(session)
@@ -270,7 +323,7 @@ async def _calculate_actual_target_count(
 			account_session_id=session.session_id,
 			content_type=content_type,
 		)
-		return len(peer_keys)
+		return peer_keys
 	finally:
 		if session_client is not None:
 			try:
@@ -650,9 +703,9 @@ async def _build_broadcast_plan(
 ) -> tuple[BroadcastPlan | None, list[str]]:
 	plans: list[SessionBroadcastPlan] = []
 	errors: list[str] = []
-	unique_groups_total = 0
 	rows_total = 0
-	actual_groups_total = 0
+	aggregated_unique_groups: list[Mapping[str, object]] = []
+	global_peer_keys: Set[tuple[str, object | tuple]] = set()
 	seen_session_ids: set[str] = set()
 	session_candidates: list[TelethonSession] = []
 	session_labels: dict[str, str] = {}
@@ -752,6 +805,7 @@ async def _build_broadcast_plan(
 			rows_from_occurrences += source_occurrences
 		rows_for_account = rows_from_stats or rows_from_occurrences or len(valid_groups)
 		unique_for_account = unique_from_stats or len(unique_groups)
+		aggregated_unique_groups.extend(dict(entry) for entry in unique_groups)
 		raw_text = metadata.get("broadcast_text") if isinstance(metadata, Mapping) else None
 		text = None
 		if isinstance(raw_text, str):
@@ -777,14 +831,10 @@ async def _build_broadcast_plan(
 			session_errors.append(
 				f"Для аккаунта {account_label} нет текста или картинки для рассылки. Добавьте материалы через /add_text или /add_image."
 			)
-		stats_actual_default = _coerce_positive_int(
-			stats_payload.get("actual_targets") if isinstance(stats_payload, Mapping) else None,
-			default=len(unique_groups),
-		)
-		actual_target_count = stats_actual_default
+		peer_keys: Set[tuple[str, object | tuple]] = set()
 		if not session_errors and unique_groups:
 			try:
-				actual_target_count = await _calculate_actual_target_count(
+				peer_keys = await _calculate_actual_target_peers(
 					context,
 					session,
 					unique_groups,
@@ -809,7 +859,10 @@ async def _build_broadcast_plan(
 					"Не удалось рассчитать фактическое количество целевых чатов",
 					extra={"session_id": session.session_id, "user_id": user_id},
 				)
-				actual_target_count = max(actual_target_count, len(unique_groups))
+		if not peer_keys and unique_groups and not session_errors:
+			for group_entry in unique_groups:
+				peer_keys.add(_fallback_peer_identity(group_entry))
+		actual_target_count = len(peer_keys)
 		if session_errors:
 			errors.extend(session_errors)
 			if skipped_group_labels:
@@ -849,22 +902,25 @@ async def _build_broadcast_plan(
 			image_meta=image_meta,
 			rows_total=rows_for_account,
 			actual_target_count=actual_target_count,
+			peer_keys=peer_keys,
 		)
 		plans.append(plan_entry)
-		unique_groups_total += len(unique_groups)
 		rows_total += rows_for_account
-		actual_groups_total += actual_target_count
+		global_peer_keys.update(peer_keys)
 
-	if plans and actual_groups_total <= 0:
+	if plans and not global_peer_keys:
 		errors.append("Не удалось определить группы для рассылки. Загрузите их через /upload_groups.")
+	unique_groups_total = len(deduplicate_broadcast_groups(aggregated_unique_groups)) if aggregated_unique_groups else 0
+	total_unique_peers = len(global_peer_keys)
 	plan = (
 		BroadcastPlan(
 			sessions=plans,
-			total_groups=actual_groups_total,
+			total_groups=total_unique_peers,
 			unique_groups_total=unique_groups_total,
 			rows_total=rows_total,
+			peer_identities=set(global_peer_keys),
 		)
-		if plans and actual_groups_total > 0
+		if plans and total_unique_peers > 0
 		else None
 	)
 	return plan, errors
@@ -930,6 +986,7 @@ async def _execute_broadcast_plan(
 	dialogs_cache: dict[str, list[object]] = {}
 	status_message = "Рассылка запущена"
 	inactive_notified: Set[str] = set()
+	processed_peer_keys: Set[tuple[str, object | tuple]] = set()
 
 	_log_broadcast(
 		logging.INFO,
@@ -1050,7 +1107,10 @@ async def _execute_broadcast_plan(
 					account_session_id=entry.session.session_id,
 				)
 				for group in entry.groups:
-					processed += 1
+					identity = _fallback_peer_identity(group)
+					if identity not in processed_peer_keys:
+						processed_peer_keys.add(identity)
+					processed = len(processed_peer_keys)
 					failed += 1
 					current_chat_label = _render_group_label(group)
 					_log_broadcast(

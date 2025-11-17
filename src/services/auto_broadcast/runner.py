@@ -88,6 +88,8 @@ class AutoBroadcastRunner:
         self._inactive_notified: Set[str] = set()
         self._auth_error_names: Set[str] = {error.__name__ for error in AUTH_ERRORS}
         self._health_check_interval = 30.0
+        self._lock_refresh_interval = max(1.0, lock_ttl_seconds / 3.0)
+        self._last_lock_refresh = time.monotonic()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -134,6 +136,20 @@ class AutoBroadcastRunner:
         except asyncio.TimeoutError:
             return
 
+    async def _refresh_task_lock(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_lock_refresh < self._lock_refresh_interval:
+            return True
+        refreshed = await self._tasks.refresh_lock(self._task_id, self._worker_id)
+        if refreshed is None:
+            logger.warning(
+                "Auto broadcast lock refresh failed",
+                extra={"task_id": self._task_id, "worker_id": self._worker_id},
+            )
+            return False
+        self._last_lock_refresh = now
+        return True
+
     @staticmethod
     def _seconds_until_due(task: AutoBroadcastTask) -> float:
         if task.next_run_ts is None:
@@ -149,6 +165,8 @@ class AutoBroadcastRunner:
         cycle_started = time.monotonic()
         total_sent = 0
         total_failed = 0
+        self._last_lock_refresh = time.monotonic()
+        global_delivered_peer_keys: Set[tuple[str, object | tuple]] = set()
 
         sessions = await self._resolve_sessions(task)
         if not sessions:
@@ -196,6 +214,7 @@ class AutoBroadcastRunner:
                         session,
                         resume_batch_index=batch_index,
                         resume_group_index=group_index,
+                        delivered_peer_keys=global_delivered_peer_keys,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -495,6 +514,7 @@ class AutoBroadcastRunner:
         *,
         resume_batch_index: int,
         resume_group_index: int,
+        delivered_peer_keys: Set[tuple[str, object | tuple]],
     ) -> Tuple[int, int]:
         self._clear_inactive_marker(session.session_id)
         client: Optional[TelegramClient] = None
@@ -523,7 +543,6 @@ class AutoBroadcastRunner:
         account_label = session.display_name()
         session_inactive = False
         last_health_check = 0.0
-        delivered_peer_keys: Set[tuple[str, object | tuple]] = set()
 
         async def _ensure_account_active(force: bool = False) -> bool:
             nonlocal last_health_check, session_inactive
@@ -550,6 +569,14 @@ class AutoBroadcastRunner:
             return False
 
         try:
+            if not await self._refresh_task_lock():
+                logger.warning(
+                    "Auto broadcast lock is no longer held",
+                    extra={"task_id": task.task_id, "account_id": session.session_id},
+                )
+                self._stop_event.set()
+                return sent, failed
+
             groups = self._groups_for_session(task, session.session_id)
             if not groups:
                 logger.warning(
@@ -581,6 +608,14 @@ class AutoBroadcastRunner:
                     break
                 if not await _ensure_account_active():
                     break
+                    if not await self._refresh_task_lock():
+                        logger.warning(
+                            "Auto broadcast lock lost mid-run",
+                            extra={"task_id": task.task_id, "account_id": session.session_id},
+                        )
+                        self._stop_event.set()
+                        session_inactive = True
+                        break
 
                 group_payload: Mapping[str, object] = group.model_dump(mode="python", by_alias=True)
                 try:
