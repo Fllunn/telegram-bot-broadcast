@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Optional
 
 from telethon import TelegramClient
@@ -14,6 +16,10 @@ from src.services.auto_broadcast import AutoBroadcastService
 from src.services.account_status import AccountStatusService
 from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
+from src.utils.telethon_reconnect import (
+    TELETHON_NETWORK_EXCEPTIONS,
+    run_with_exponential_backoff,
+)
 
 
 class BotApplication:
@@ -23,6 +29,9 @@ class BotApplication:
         self._bot_token = bot_token
         self._client = TelegramClient(bot_session_name, api_id, api_hash)
         self._context: Optional[BotContext] = None
+        self._handlers_registered = False
+        self._stop_event: asyncio.Event | None = None
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
     async def start(
         self,
@@ -33,6 +42,11 @@ class BotApplication:
         account_status_service: AccountStatusService,
     ) -> None:
         """Start the Telethon client and register command handlers."""
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        else:
+            self._stop_event.clear()
+
         if self._context is None:
             auth_manager = AuthStateManager()
             broadcast_manager = BroadcastStateManager()
@@ -53,17 +67,90 @@ class BotApplication:
                 account_status_service=account_status_service,
             )
 
-        await self._client.start(bot_token=self._bot_token)
-        register_commands(self._client, self._context)
+        context = self._context
+        if context is None:  # defensive guard for type checkers
+            raise RuntimeError("Bot context failed to initialize")
+
+        await run_with_exponential_backoff(
+            lambda: self._client.start(bot_token=self._bot_token),
+            label="telethon.bot.start",
+            logger=self._logger,
+            log_context={"client": "bot"},
+        )
+
+        if not self._handlers_registered:
+            register_commands(self._client, context)
+            self._handlers_registered = True
 
     async def idle(self) -> None:
         """Block until the bot is disconnected."""
-        await self._client.run_until_disconnected()
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+
+        reconnect_attempt = 0
+        while True:
+            try:
+                await self._client.run_until_disconnected()
+            except asyncio.CancelledError:
+                raise
+            except TELETHON_NETWORK_EXCEPTIONS as exc:
+                self._logger.warning(
+                    "Bot client stopped due to network issue: %s",
+                    exc,
+                    extra={"client": "bot"},
+                )
+            except Exception:
+                self._logger.exception(
+                    "Bot client stopped unexpectedly",
+                    extra={"client": "bot"},
+                )
+
+            if self._stop_event.is_set():
+                break
+
+            reconnect_attempt += 1
+            delay = min(2 ** reconnect_attempt, 60)
+            log_extra = {
+                "client": "bot",
+                "reconnect_attempt": reconnect_attempt,
+                "reconnect_delay": delay,
+            }
+            self._logger.warning(
+                "Bot client disconnected; reconnecting in %s seconds",
+                delay,
+                extra=log_extra,
+            )
+            await asyncio.sleep(delay)
+
+            if self._stop_event.is_set():
+                break
+
+            await run_with_exponential_backoff(
+                lambda: self._client.start(bot_token=self._bot_token),
+                label="telethon.bot.reconnect",
+                logger=self._logger,
+                log_context={
+                    "client": "bot",
+                    "reconnect_attempt": reconnect_attempt,
+                },
+            )
+            reconnect_attempt = 0
 
     async def stop(self) -> None:
         """Disconnect the Telethon bot client."""
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        self._stop_event.set()
+
         if self._client.is_connected():
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except TELETHON_NETWORK_EXCEPTIONS as exc:
+                self._logger.warning(
+                    "Bot client disconnect reported network error: %s",
+                    exc,
+                    extra={"client": "bot"},
+                )
 
     @property
     def client(self) -> TelegramClient:

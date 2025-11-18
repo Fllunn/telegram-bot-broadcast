@@ -5,10 +5,9 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import (
     AuthKeyUnregisteredError,
@@ -16,9 +15,14 @@ from telethon.errors.rpcerrorlist import (
     UserDeactivatedError,
     UserDeactivatedBanError,
 )
+from telethon.sessions import StringSession
 
 from src.db.repositories.session_repository import SessionRepository
 from src.models.session import SessionOwnerType, TelethonSession
+from src.utils.telethon_reconnect import (
+    TELETHON_NETWORK_EXCEPTIONS,
+    run_with_exponential_backoff,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +67,12 @@ class TelethonSessionManager:
         """Create and connect a fresh Telethon client for onboarding flows."""
         session = StringSession()
         client = TelegramClient(session, self._api_id, self._api_hash)
-        await client.connect()
+        await run_with_exponential_backoff(
+            client.connect,
+            label="telethon.session.temporary.connect",
+            logger=logger,
+            log_context={"client": "temporary"},
+        )
         return client
 
     async def build_client_from_session(self, session: TelethonSession) -> TelegramClient:
@@ -72,7 +81,12 @@ class TelethonSessionManager:
             raise ValueError("Session data is missing; cannot restore Telethon client")
         string_session = StringSession(session.session_data)
         client = TelegramClient(string_session, self._api_id, self._api_hash)
-        await client.connect()
+        await run_with_exponential_backoff(
+            client.connect,
+            label="telethon.session.restore.connect",
+            logger=logger,
+            log_context={"session_id": session.session_id},
+        )
         return client
 
     async def persist_session(self, session: TelethonSession) -> TelethonSession:
@@ -103,13 +117,29 @@ class TelethonSessionManager:
                 if client.is_connected():
                     return client
                 with contextlib.suppress(Exception):
-                    await client.connect()
+                    await run_with_exponential_backoff(
+                        client.connect,
+                        label="telethon.session.pooled.reconnect",
+                        logger=logger,
+                        log_context={
+                            "session_id": session.session_id,
+                            "owner_id": session.owner_id,
+                        },
+                    )
                     if client.is_connected():
                         return client
 
             string_session = StringSession(session.session_data)
             client = TelegramClient(string_session, self._api_id, self._api_hash)
-            await client.connect()
+            await run_with_exponential_backoff(
+                client.connect,
+                label="telethon.session.pooled.connect",
+                logger=logger,
+                log_context={
+                    "session_id": session.session_id,
+                    "owner_id": session.owner_id,
+                },
+            )
             self._pooled_clients[session.session_id] = client
             return client
 
@@ -370,4 +400,7 @@ class TelethonSessionManager:
     async def close_client(self, client: TelegramClient) -> None:
         """Gracefully disconnect a Telethon client."""
         if client.is_connected():
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except TELETHON_NETWORK_EXCEPTIONS as exc:
+                logger.warning("Telethon disconnect reported network error: %s", exc)
