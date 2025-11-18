@@ -11,13 +11,45 @@ from urllib.parse import urlparse
 
 from telethon import utils
 from telethon.errors import FloodWaitError, RPCError
-from telethon.errors.rpcerrorlist import ChatWriteForbiddenError, FileReferenceExpiredError, MediaEmptyError
+from telethon.errors.rpcerrorlist import (
+    ChatSendMediaForbiddenError,
+    ChatWriteForbiddenError,
+    FileReferenceExpiredError,
+    FileReferenceInvalidError,
+    MediaEmptyError,
+    PhotoInvalidDimensionsError,
+)
+from telethon.extensions import markdown as markdown_ext
+from telethon.tl import types as tl_types
 
 logger = logging.getLogger(__name__)
 
 _KEY_INFO_PREFIXES: tuple[str, ...] = (
     "Рассылка запущена",
     "Рассылка завершена",
+)
+
+_MEDIA_ERROR_KEYWORDS: Tuple[str, ...] = (
+    "MEDIA",
+    "PHOTO",
+    "IMAGE",
+    "DOCUMENT",
+    "ALBUM",
+    "STICKER",
+    "FILE",
+    "GIF",
+    "VIDEO",
+    "WEBDOCUMENT",
+)
+
+_MEDIA_RETRY_KEYWORDS: Tuple[str, ...] = (
+    "FILE_REFERENCE",
+    "FILE_PART",
+    "FILE_ID",
+    "MEDIA_EMPTY",
+    "MEDIA_INVALID",
+    "PHOTO_INVALID",
+    "UPLOAD",
 )
 
 
@@ -183,6 +215,61 @@ def deduplicate_broadcast_groups(groups: Sequence[Mapping[str, object]]) -> List
     return [unique[key] for key in order]
 
 
+
+def _prepare_broadcast_text(raw_text: Optional[str]) -> PreparedMessageContent:
+    if raw_text is None:
+        return PreparedMessageContent(text=None, entities=())
+    text = raw_text if isinstance(raw_text, str) else str(raw_text)
+    if not text:
+        return PreparedMessageContent(text=None, entities=())
+    try:
+        parsed_text, entities = markdown_ext.parse(text)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning(
+            "Не удалось разобрать текст рассылки через markdown.parse",
+            extra={"error": str(exc), "error_type": exc.__class__.__name__},
+            exc_info=True,
+        )
+        return PreparedMessageContent(text=text, entities=())
+    normalized_text = parsed_text or None
+    normalized_entities: Tuple[tl_types.TypeMessageEntity, ...] = tuple(entities or ())
+    return PreparedMessageContent(text=normalized_text, entities=normalized_entities)
+
+
+def _is_media_related_error(error: BaseException) -> bool:
+    if isinstance(error, ChatWriteForbiddenError):
+        return True
+    if isinstance(error, (ChatSendMediaForbiddenError, MediaEmptyError, PhotoInvalidDimensionsError)):
+        return True
+    if isinstance(error, RPCError):
+        name = error.__class__.__name__.upper()
+        if any(keyword in name for keyword in _MEDIA_ERROR_KEYWORDS):
+            return True
+        message = getattr(error, "rpc_error", None) or getattr(error, "message", None)
+        if isinstance(message, str) and any(keyword in message.upper() for keyword in _MEDIA_ERROR_KEYWORDS):
+            return True
+        error_text = str(error)
+        if any(keyword in error_text.upper() for keyword in _MEDIA_ERROR_KEYWORDS):
+            return True
+    return False
+
+
+def _should_retry_media_from_bytes(error: BaseException) -> bool:
+    if isinstance(error, (FileReferenceExpiredError, FileReferenceInvalidError, MediaEmptyError)):
+        return True
+    if isinstance(error, RPCError):
+        name = error.__class__.__name__.upper()
+        if any(keyword in name for keyword in _MEDIA_RETRY_KEYWORDS):
+            return True
+        message = getattr(error, "rpc_error", None) or getattr(error, "message", None)
+        if isinstance(message, str) and any(keyword in message.upper() for keyword in _MEDIA_RETRY_KEYWORDS):
+            return True
+        error_text = str(error)
+        if any(keyword in error_text.upper() for keyword in _MEDIA_RETRY_KEYWORDS):
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class BroadcastImageData:
     """Prepared input media reference for broadcasting images."""
@@ -192,6 +279,14 @@ class BroadcastImageData:
     raw_bytes: Optional[bytes] = None
     file_name: Optional[str] = None
     mime_type: Optional[str] = None
+
+
+@dataclass(slots=True)
+class PreparedMessageContent:
+    """Represents parsed text and entities ready for Telethon delivery."""
+
+    text: Optional[str]
+    entities: Tuple[tl_types.TypeMessageEntity, ...] = ()
 
 
 @dataclass(slots=True)
@@ -537,32 +632,61 @@ async def send_payload_to_group(
     if extra_log_context:
         context.update({k: v for k, v in extra_log_context.items() if v is not None})
 
-    async def _send_once() -> None:
-        if image_data is not None:
-            if image_data.media is not None:
-                await session_client.send_file(
-                    entity,
-                    file=image_data.media,
-                    caption=text or None,
-                    force_document=image_data.force_document,
-                    parse_mode="html",
-                    link_preview=False,
-                )
-            elif image_data.raw_bytes is not None:
-                await _send_from_bytes()
-            else:
-                raise RuntimeError("Недоступны данные картинки")
-        elif text:
+    prepared_text = _prepare_broadcast_text(text)
+
+    async def _send_text_message(allow_entities: bool = True) -> None:
+        if not prepared_text.text:
+            raise RuntimeError("Нет текста для отправки")
+        formatting_entities = prepared_text.entities if allow_entities and prepared_text.entities else None
+        try:
             await session_client.send_message(
                 entity,
-                text,
-                parse_mode="html",
+                prepared_text.text,
+                formatting_entities=formatting_entities,
+                parse_mode=None,
                 link_preview=False,
             )
-        else:
-            raise RuntimeError("Нет данных для отправки")
+        except TypeError as exc:
+            log_broadcast_event(
+                logging.WARNING,
+                "Форматирование текста недоступно, отправляем без entities",
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+                **context,
+            )
+            if allow_entities and prepared_text.entities:
+                await _send_text_message(False)
+            else:
+                raise
 
-    async def _send_from_bytes() -> None:
+    async def _send_file_from_media(allow_entities: bool = True) -> None:
+        if image_data is None or image_data.media is None:
+            raise RuntimeError("Медиа отсутствует для отправки")
+        caption = prepared_text.text or None
+        caption_entities = prepared_text.entities if allow_entities and caption else None
+        try:
+            await session_client.send_file(
+                entity,
+                file=image_data.media,
+                caption=caption,
+                caption_entities=caption_entities,
+                force_document=image_data.force_document,
+                parse_mode=None,
+            )
+        except TypeError as exc:
+            log_broadcast_event(
+                logging.WARNING,
+                "Ошибка применения entities к подписи, пробуем без форматирования",
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+                **context,
+            )
+            if allow_entities and caption_entities:
+                await _send_file_from_media(False)
+            else:
+                raise
+
+    async def _send_file_from_bytes(allow_entities: bool = True) -> None:
         if image_data is None or image_data.raw_bytes is None:
             raise RuntimeError("Нет байт картинки для отправки")
         buffer = BytesIO(image_data.raw_bytes)
@@ -575,14 +699,119 @@ async def send_payload_to_group(
                 extension = ".jpg" if not image_data.force_document else ".bin"
             file_name = "broadcast" + extension
         buffer.name = file_name
-        await session_client.send_file(
-            entity,
-            file=buffer,
-            caption=text or None,
-            force_document=image_data.force_document,
-            parse_mode="html",
-            link_preview=False,
+        caption = prepared_text.text or None
+        caption_entities = prepared_text.entities if allow_entities and caption else None
+        try:
+            await session_client.send_file(
+                entity,
+                file=buffer,
+                caption=caption,
+                caption_entities=caption_entities,
+                force_document=image_data.force_document,
+                parse_mode=None,
+            )
+        except TypeError as exc:
+            log_broadcast_event(
+                logging.WARNING,
+                "Ошибка применения entities к подписи из байтов, пробуем без форматирования",
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+                **context,
+            )
+            if allow_entities and caption_entities:
+                await _send_file_from_bytes(False)
+            else:
+                raise
+
+    async def _fallback_to_text(
+        trigger_error: BaseException,
+        *,
+        message: str,
+        log_level: int = logging.DEBUG,
+    ) -> None:
+        if not prepared_text.text:
+            raise trigger_error
+        log_broadcast_event(
+            log_level,
+            message,
+            error=str(trigger_error),
+            error_type=trigger_error.__class__.__name__,
+            fallback_mode="text_only",
+            **context,
         )
+        await _send_text_message()
+
+    async def _send_media_with_optional_fallback() -> None:
+        if image_data is None:
+            raise RuntimeError("Нет данных для отправки")
+        try:
+            if image_data.media is not None:
+                await _send_file_from_media()
+            elif image_data.raw_bytes is not None:
+                await _send_file_from_bytes()
+            else:
+                raise RuntimeError("Недоступны данные картинки")
+        except Exception as exc:
+            if _should_retry_media_from_bytes(exc):
+                retry_message = "Ссылка на медиа недействительна, пробуем повторную загрузку из байтов"
+                if isinstance(exc, FileReferenceExpiredError):
+                    retry_message = "Ссылка на медиа устарела, пытаемся отправить из байтов"
+                if image_data.raw_bytes is None:
+                    await _fallback_to_text(
+                        exc,
+                        message="Ссылка на медиа недоступна, сохраняем доставку только текстом",
+                    )
+                    return
+                log_broadcast_event(
+                    logging.DEBUG,
+                    retry_message,
+                    error=str(exc),
+                    error_type=exc.__class__.__name__,
+                    **context,
+                )
+                try:
+                    await _send_file_from_bytes()
+                except Exception as upload_exc:
+                    if isinstance(upload_exc, TypeError):
+                        await _fallback_to_text(
+                            upload_exc,
+                            message="Ошибка обработки entities при повторной загрузке медиа, переключаемся на текст",
+                            log_level=logging.DEBUG,
+                        )
+                        return
+                    if _is_media_related_error(upload_exc):
+                        await _fallback_to_text(
+                            upload_exc,
+                            message="Отправка медиа невозможна после повторной загрузки, выполняем fallback на текст",
+                            log_level=logging.DEBUG,
+                        )
+                        return
+                    raise
+                return
+            if isinstance(exc, TypeError):
+                await _fallback_to_text(
+                    exc,
+                    message="Ошибка обработки entities при отправке медиа, переключаемся на текст",
+                    log_level=logging.DEBUG,
+                )
+                return
+            if _is_media_related_error(exc):
+                await _fallback_to_text(
+                    exc,
+                    message="Отправка медиа невозможна, выполняем fallback на текст",
+                    log_level=logging.DEBUG,
+                )
+                return
+            raise
+
+    async def _send_once() -> None:
+        if image_data is not None:
+            await _send_media_with_optional_fallback()
+            return
+        if prepared_text.text:
+            await _send_text_message()
+            return
+        raise RuntimeError("Нет данных для отправки")
 
     log_broadcast_event(logging.INFO, f"Начата отправка в группу — {group_label}", **context)
 
@@ -615,39 +844,13 @@ async def send_payload_to_group(
             return True, None
     except FileReferenceExpiredError as exc:
         log_broadcast_event(
-            logging.WARNING,
-            f"Ссылка на файл устарела ({exc.__class__.__name__}), пробуем переотправить из сохранённых данных",
+            logging.ERROR,
+            "Медиа недоступно: устаревшая ссылка, отсутствуют байты и fallback-текст",
             error=str(exc),
             error_type=exc.__class__.__name__,
             **context,
         )
-        if image_data is None or image_data.raw_bytes is None:
-            log_broadcast_event(
-                logging.ERROR,
-                f"Не удалось восстановить файл картинки ({exc.__class__.__name__}): отсутствуют сохранённые байты",
-                error=str(exc),
-                error_type=exc.__class__.__name__,
-                **context,
-            )
-            return False, exc.__class__.__name__
-        try:
-            await _send_from_bytes()
-        except Exception as err:
-            log_broadcast_event(
-                logging.ERROR,
-                f"Повторная отправка картинки из байтов завершилась ошибкой ({err.__class__.__name__})",
-                error=str(err),
-                error_type=err.__class__.__name__,
-                **context,
-            )
-            return False, err.__class__.__name__
-        else:
-            log_broadcast_event(
-                logging.INFO,
-                "Сообщение отправлено после обновления файла",
-                **context,
-            )
-            return True, None
+        return False, exc.__class__.__name__
     except ChatWriteForbiddenError as exc:
         log_broadcast_event(
             logging.ERROR,
@@ -658,32 +861,6 @@ async def send_payload_to_group(
         )
         return False, "нет прав на отправку"
     except RPCError as rpc_error:
-        if isinstance(rpc_error, MediaEmptyError) and image_data is not None and image_data.raw_bytes is not None:
-            log_broadcast_event(
-                logging.WARNING,
-                f"Получен MediaEmptyError ({rpc_error.__class__.__name__}), пробуем отправить изображение из сохранённых байтов",
-                error=str(rpc_error),
-                error_type=rpc_error.__class__.__name__,
-                **context,
-            )
-            try:
-                await _send_from_bytes()
-            except Exception as err:
-                log_broadcast_event(
-                    logging.ERROR,
-                    f"Повторная отправка после MediaEmptyError не удалась ({err.__class__.__name__})",
-                    error=str(err),
-                    error_type=err.__class__.__name__,
-                    **context,
-                )
-                return False, err.__class__.__name__
-            else:
-                log_broadcast_event(
-                    logging.INFO,
-                    "Сообщение отправлено после повторной загрузки медиа",
-                    **context,
-                )
-                return True, None
         log_broadcast_event(
             logging.ERROR,
             f"Ошибка RPC при отправке сообщения ({rpc_error.__class__.__name__})",

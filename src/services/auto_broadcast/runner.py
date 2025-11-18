@@ -176,7 +176,7 @@ class AutoBroadcastRunner:
         return max(0.0, delta)
 
     async def _execute_cycle(self, task: AutoBroadcastTask) -> None:
-        logger.info("Starting auto broadcast cycle", extra={"task_id": task.task_id, "user_id": task.user_id})
+        logger.debug("Starting auto broadcast cycle", extra={"task_id": task.task_id, "user_id": task.user_id})
         cycle_started = time.monotonic()
         self._last_lock_refresh = time.monotonic()
 
@@ -452,7 +452,7 @@ class AutoBroadcastRunner:
             for account_id, stats in per_account_stats.items()
         }
 
-        logger.info(
+        logger.debug(
             "Auto broadcast cycle summary",
             extra={
                 "task_id": task.task_id,
@@ -1097,7 +1097,7 @@ class AutoBroadcastRunner:
             f"Чатов в цикле: {groups_total}.\n"
             f"Ожидаемая длительность: ≈ {self._format_duration(expected_seconds)}"
         )
-        logger.info(
+        logger.debug(
             "Auto broadcast cycle started",
             extra={
                 "event_type": "auto_broadcast_cycle_start",
@@ -1127,7 +1127,7 @@ class AutoBroadcastRunner:
             f"Длительность: {self._format_duration(duration_seconds)}.\n"
             f"Следующий запуск: {formatted_next_run}"
         )
-        logger.info(
+        logger.debug(
             "Auto broadcast cycle completed",
             extra={
                 "event_type": "auto_broadcast_cycle_end",

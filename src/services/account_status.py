@@ -178,7 +178,7 @@ class AccountStatusService:
             )
             result = self._build_result(session, report)
             await self._persist_result(session, result)
-            log_level = logging.INFO if result.active else logging.WARNING
+            log_level = logging.DEBUG if result.active else logging.WARNING
             logger.log(
                 log_level,
                 "Account status probe completed",
