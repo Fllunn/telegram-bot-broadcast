@@ -6,3 +6,7 @@ python-dotenv>=1.0.0
 qrcode[pil]>=7.4.2
 openpyxl==3.1.2
 xlrd==2.0.1
+aiohttp>=3.9.0
+google-api-python-client>=2.146.0
+google-auth>=2.35.0
+google-auth-httplib2>=0.2.0

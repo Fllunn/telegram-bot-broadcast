@@ -9,11 +9,13 @@ from telethon import TelegramClient
 from src.bot.context import BotContext
 from src.bot.router import register_commands
 from src.db.repositories.session_repository import SessionRepository
+from src.db.repositories.group_sheet_repository import GroupSheetRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.auth_state import AuthStateManager
 from src.services.auto_broadcast import AutoBroadcastService
 from src.services.account_status import AccountStatusService
+from src.services.sheet_monitor import GroupSheetMonitorService
 from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
 from src.utils.telethon_reconnect import (
@@ -40,6 +42,8 @@ class BotApplication:
         session_manager: TelethonSessionManager,
         auto_broadcast_service: AutoBroadcastService,
         account_status_service: AccountStatusService,
+        group_sheet_repository: GroupSheetRepository | None = None,
+        group_sheet_monitor: GroupSheetMonitorService | None = None,
     ) -> None:
         """Start the Telethon client and register command handlers."""
         if self._stop_event is None:
@@ -65,6 +69,8 @@ class BotApplication:
                 group_view_manager=group_view_manager,
                 auto_broadcast_service=auto_broadcast_service,
                 account_status_service=account_status_service,
+                group_sheet_repository=group_sheet_repository,
+                group_sheet_monitor=group_sheet_monitor,
             )
 
         context = self._context
@@ -81,6 +87,13 @@ class BotApplication:
         if not self._handlers_registered:
             register_commands(self._client, context)
             self._handlers_registered = True
+
+        # Start monitor after handlers (does not depend on them but ensures client running)
+        if context.group_sheet_monitor is not None:
+            try:
+                await context.group_sheet_monitor.start()
+            except Exception:
+                self._logger.exception("Failed to start group sheet monitor service")
 
     async def idle(self) -> None:
         """Block until the bot is disconnected."""

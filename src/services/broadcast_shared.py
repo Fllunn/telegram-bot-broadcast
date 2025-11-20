@@ -299,6 +299,43 @@ class ResolvedGroupTarget:
     log_context: dict[str, Any]
 
 
+@dataclass(slots=True)
+class BroadcastAttemptOutcome:
+    success: bool
+    reason: Optional[str]
+    error: Optional[BaseException]
+
+
+@dataclass(slots=True)
+class BroadcastSendResult:
+    success: bool
+    attempts: int
+    transient_errors: List[str]
+    final_error: Optional[str]
+    final_exception: Optional[BaseException]
+
+
+DEFAULT_MAX_SEND_ATTEMPTS = 3
+DEFAULT_RETRY_BASE_DELAY = 1.5
+MAX_RETRY_BACKOFF_SECONDS = 10.0
+TRANSIENT_ERROR_REASONS: Set[str] = {
+    "FloodWaitError",
+    "RetryAfter",
+    "TimedOutError",
+    "TimeoutError",
+    "ServerError",
+    "RpcCallFailError",
+    "SlowModeWaitError",
+    "PhoneMigrateError",
+}
+TRANSIENT_ERROR_TYPES: Tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionError,
+    FloodWaitError,
+)
+
+
 def _resolved_target_identity(target: ResolvedGroupTarget) -> tuple[str, object | tuple]:
     try:
         peer_id = utils.get_peer_id(target.entity)
@@ -607,7 +644,7 @@ async def resolve_group_targets(
     return [], None
 
 
-async def send_payload_to_group(
+async def _send_payload_once(
     session_client,
     entity,
     text: Optional[str],
@@ -620,7 +657,7 @@ async def send_payload_to_group(
     group_label: str,
     content_type: str,
     extra_log_context: Optional[Mapping[str, Any]] = None,
-) -> Tuple[bool, Optional[str]]:
+) -> BroadcastAttemptOutcome:
     context = {
         "user_id": user_id,
         "account_label": account_label,
@@ -838,10 +875,10 @@ async def send_payload_to_group(
                 error_type=err.__class__.__name__,
                 **context,
             )
-            return False, err.__class__.__name__
+            return BroadcastAttemptOutcome(False, err.__class__.__name__, err)
         else:
             log_broadcast_event(logging.INFO, "Сообщение отправлено после ожидания FloodWait", **context)
-            return True, None
+            return BroadcastAttemptOutcome(True, None, None)
     except FileReferenceExpiredError as exc:
         log_broadcast_event(
             logging.ERROR,
@@ -850,7 +887,7 @@ async def send_payload_to_group(
             error_type=exc.__class__.__name__,
             **context,
         )
-        return False, exc.__class__.__name__
+        return BroadcastAttemptOutcome(False, exc.__class__.__name__, exc)
     except ChatWriteForbiddenError as exc:
         log_broadcast_event(
             logging.ERROR,
@@ -859,7 +896,7 @@ async def send_payload_to_group(
             error_type=exc.__class__.__name__,
             **context,
         )
-        return False, "нет прав на отправку"
+        return BroadcastAttemptOutcome(False, "нет прав на отправку", exc)
     except RPCError as rpc_error:
         log_broadcast_event(
             logging.ERROR,
@@ -868,7 +905,7 @@ async def send_payload_to_group(
             error_type=rpc_error.__class__.__name__,
             **context,
         )
-        return False, rpc_error.__class__.__name__
+        return BroadcastAttemptOutcome(False, rpc_error.__class__.__name__, rpc_error)
     except Exception as err:
         log_broadcast_event(
             logging.ERROR,
@@ -877,10 +914,90 @@ async def send_payload_to_group(
             error_type=err.__class__.__name__,
             **context,
         )
-        return False, err.__class__.__name__
+        return BroadcastAttemptOutcome(False, err.__class__.__name__, err)
     else:
         log_broadcast_event(logging.INFO, "Сообщение успешно отправлено", **context)
-        return True, None
+        return BroadcastAttemptOutcome(True, None, None)
+
+
+def _is_transient_failure(outcome: BroadcastAttemptOutcome) -> bool:
+    if outcome.success:
+        return False
+    if outcome.error and isinstance(outcome.error, TRANSIENT_ERROR_TYPES):
+        return True
+    if outcome.reason and outcome.reason in TRANSIENT_ERROR_REASONS:
+        return True
+    return False
+
+
+async def send_payload_to_group(
+    session_client,
+    entity,
+    text: Optional[str],
+    image_data: Optional[BroadcastImageData],
+    *,
+    user_id: int,
+    account_label: str,
+    account_session_id: str,
+    group: Mapping[str, object],
+    group_label: str,
+    content_type: str,
+    extra_log_context: Optional[Mapping[str, Any]] = None,
+    max_attempts: int = DEFAULT_MAX_SEND_ATTEMPTS,
+    retry_delay: float = DEFAULT_RETRY_BASE_DELAY,
+) -> BroadcastSendResult:
+    attempts = 0
+    transient_errors: List[str] = []
+    last_outcome: Optional[BroadcastAttemptOutcome] = None
+    max_attempts = max(1, int(max_attempts))
+    delay = max(0.0, retry_delay)
+
+    for attempt in range(1, max_attempts + 1):
+        last_outcome = await _send_payload_once(
+            session_client,
+            entity,
+            text,
+            image_data,
+            user_id=user_id,
+            account_label=account_label,
+            account_session_id=account_session_id,
+            group=group,
+            group_label=group_label,
+            content_type=content_type,
+            extra_log_context=extra_log_context,
+        )
+        attempts = attempt
+        if last_outcome.success:
+            return BroadcastSendResult(True, attempts, transient_errors, None, None)
+
+        is_transient = _is_transient_failure(last_outcome)
+        if is_transient:
+            reason_label = last_outcome.reason
+            if not reason_label and last_outcome.error is not None:
+                reason_label = last_outcome.error.__class__.__name__
+            if reason_label:
+                transient_errors.append(reason_label)
+        else:
+            break
+
+        if attempt >= max_attempts:
+            break
+
+        if delay > 0:
+            await asyncio.sleep(min(MAX_RETRY_BACKOFF_SECONDS, delay))
+            delay = min(MAX_RETRY_BACKOFF_SECONDS, delay * 2 or DEFAULT_RETRY_BASE_DELAY)
+
+    final_error: Optional[str] = None
+    final_exception: Optional[BaseException] = None
+    if last_outcome is not None:
+        if last_outcome.reason:
+            final_error = last_outcome.reason
+        elif last_outcome.error is not None:
+            final_error = last_outcome.error.__class__.__name__
+        final_exception = last_outcome.error
+    if attempts == 0:
+        attempts = 1
+    return BroadcastSendResult(False, attempts, transient_errors, final_error, final_exception)
 
 
 _log_broadcast = log_broadcast_event
@@ -894,6 +1011,8 @@ _extract_identifier_from_link_value = extract_identifier_from_link_value
 
 __all__ = [
     "BroadcastImageData",
+    "BroadcastAttemptOutcome",
+    "BroadcastSendResult",
     "ResolvedGroupTarget",
     "DialogsFetchError",
     "sanitize_username_value",

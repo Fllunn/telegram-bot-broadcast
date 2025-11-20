@@ -17,6 +17,15 @@ from telethon.tl.types import DocumentAttributeFilename
 
 from src.bot.context import BotContext
 from src.bot.keyboards import UPLOAD_GROUPS_LABEL, VIEW_GROUPS_LABEL, build_main_menu_keyboard
+from src.services.google_sheets import (
+    FetchError as GSheetsFetchError,
+    InvalidLinkError as GSheetsInvalidLinkError,
+    NotFoundError as GSheetsNotFoundError,
+    PublicAccessRequiredError as GSheetsAccessError,
+    fetch_rows_from_link as gs_fetch_rows,
+    is_google_sheets_link as gs_is_link,
+    parse_google_sheets_link as gs_parse_link,
+)
 from src.models.session import TelethonSession
 from src.services.broadcast_shared import (
     DialogsFetchError,
@@ -327,12 +336,39 @@ def _parse_xls(content: bytes) -> List[ParsedGroup]:
 
 
 def _is_header_row(name: str, username: str, link: str) -> bool:
-    header_tokens = {token.lower() for token in (name, username, link) if token}
-    return bool(
-        {"название", "название группы", "name"} & header_tokens
-        or {"username", "юзернейм"} & header_tokens
-        or {"ссылка", "link"} & header_tokens
+    header_tokens = [token.lower() for token in (name, username, link) if token]
+
+    def _contains_keyword(keywords: tuple[str, ...]) -> bool:
+        for token in header_tokens:
+            normalized = token.strip()
+            if not normalized:
+                continue
+            for keyword in keywords:
+                if keyword in normalized:
+                    return True
+        return False
+
+    return (
+        _contains_keyword(("название", "название группы", "name"))
+        or _contains_keyword(("username", "юзернейм"))
+        or _contains_keyword(("ссылка", "link"))
     )
+
+
+def _parse_rows_to_groups(rows: List[List[object]]) -> List[ParsedGroup]:
+    parsed: List[ParsedGroup] = []
+    for idx, row in enumerate(rows):
+        row = row or []
+        name = _normalize_cell_value(row[0]) if len(row) > 0 else ""
+        username = _normalize_cell_value(row[1]) if len(row) > 1 else ""
+        link = _normalize_cell_value(row[2]) if len(row) > 2 else ""
+        name, username, link = _prepare_group_fields(name, username, link)
+        if idx == 0 and _is_header_row(name, username, link):
+            continue
+        if not any((name, username, link)):
+            continue
+        parsed.append(ParsedGroup(name=name or None, username=username or None, link=link or None))
+    return parsed
 
 
 
@@ -737,7 +773,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             else:
                 upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
                 message = await event.edit(
-                    "Отправьте Excel-файл (.xlsx или .xls) со списком групп. Первая строка может быть заголовком.",
+                    "Отправьте Excel-файл (.xlsx или .xls) со списком групп или пришлите ссылку на Google Таблицу, открытую по ссылке (просмотр). Первая строка может быть заголовком.",
                     buttons=_build_file_prompt_buttons(),
                 )
             upload_manager.update(user_id, last_message_id=message.id)
@@ -807,7 +843,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         else:
             upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
             message = await event.edit(
-                "Отправьте Excel-файл (.xlsx или .xls) со списком групп. Первая строка может быть заголовком.",
+                "Отправьте Excel-файл (.xlsx или .xls) со списком групп или пришлите ссылку на Google Таблицу, открытую по ссылке (просмотр). Первая строка может быть заголовком.",
                 buttons=_build_file_prompt_buttons(),
             )
         upload_manager.update(user_id, last_message_id=message.id)
@@ -873,7 +909,7 @@ def setup_group_commands(client, context: BotContext) -> None:
 
         upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
         message = await event.edit(
-            "Отправьте Excel-файл (.xlsx или .xls) со списком групп. Первая строка может быть заголовком.",
+            "Отправьте Excel-файл (.xlsx или .xls) со списком групп или пришлите ссылку на Google Таблицу, открытую по ссылке (просмотр). Первая строка может быть заголовком.",
             buttons=_build_file_prompt_buttons(),
         )
         upload_manager.update(user_id, last_message_id=message.id)
@@ -912,10 +948,258 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
 
         document = event.document
+        # New: allow Google Sheets link as an alternative to file
         if document is None:
+            if message_text and gs_is_link(message_text):
+                # Process Google Sheets
+                upload_manager.update(user_id, last_message_id=event.id)
+                status_msg = await event.respond("Загружаю таблицу, подождите…")
+                try:
+                    rows = await gs_fetch_rows(message_text)
+                except GSheetsInvalidLinkError:
+                    await status_msg.edit("Некорректная ссылка, пришлите правильную ссылку на Google Таблицу.")
+                    return
+                except GSheetsAccessError:
+                    await status_msg.edit(
+                        "Не удалось открыть таблицу: по ссылке нет доступа на просмотр. Откройте возможность просмотра по ссылке и отправьте ещё раз."
+                    )
+                    return
+                except GSheetsNotFoundError:
+                    await status_msg.edit("Некорректная ссылка, пришлите правильную ссылку на Google Таблицу.")
+                    return
+                except GSheetsFetchError:
+                    await status_msg.edit(
+                        "Не удалось загрузить таблицу. Попробуйте ещё раз или отправьте «Отмена»."
+                    )
+                    return
+                except Exception:
+                    logger.exception("Неожиданная ошибка при загрузке Google Таблицы", extra={"user_id": user_id})
+                    await status_msg.edit(
+                        "Не удалось загрузить таблицу. Попробуйте ещё раз или отправьте «Отмена»."
+                    )
+                    return
+
+                try:
+                    parsed_groups = _parse_rows_to_groups(rows)
+                except Exception:
+                    logger.exception("Ошибка при чтении CSV с группами", extra={"user_id": user_id})
+                    await status_msg.edit(
+                        "Не удалось прочитать таблицу. Убедитесь, что в первых трёх столбцах — название, username, ссылка."
+                    )
+                    return
+
+                if not parsed_groups:
+                    await status_msg.edit("Таблица пустая.")
+                    return
+
+                # Continue with the same pipeline as for files using parsed_groups
+                state = upload_manager.get(user_id)
+                if state is None:
+                    logger.warning("Состояние загрузки групп потеряно", extra={"user_id": user_id})
+                    await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
+                    return
+
+                target_ids = list(state.target_session_ids or [])
+                resolved_snapshots: list[UploadAccountSnapshot] = []
+
+                if state.scope == GroupUploadScope.SINGLE:
+                    selected_id = getattr(state, "selected_session_id", None)
+                    if not selected_id:
+                        logger.warning("Нет выбранного аккаунта при загрузке одиночного списка групп", extra={"user_id": user_id})
+                        await _handle_cancel(event, upload_manager, "Аккаунт не выбран. Запустите загрузку заново.")
+                        return
+                    state, snapshot = await _ensure_upload_snapshot(user_id, state, selected_id, ensure_cached=True)
+                    if snapshot is None:
+                        logger.warning(
+                            "Не удалось подтвердить выбранный аккаунт при загрузке таблицы",
+                            extra={"user_id": user_id, "session_id": selected_id},
+                        )
+                        await _handle_cancel(event, upload_manager, "Выбор аккаунта устарел. Запустите загрузку заново.")
+                        return
+                    target_ids = [snapshot.session_id]
+                    resolved_snapshots.append(snapshot)
+                else:
+                    if not target_ids:
+                        logger.warning("Нет целевых аккаунтов для сохранения групп", extra={"user_id": user_id})
+                        await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
+                        return
+                    sanitized_ids: list[str] = []
+                    for session_id in target_ids:
+                        state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=True)
+                        if snapshot is None:
+                            logger.warning(
+                                "Целевой аккаунт недоступен при загрузке таблицы",
+                                extra={"user_id": user_id, "session_id": session_id},
+                            )
+                            await _handle_cancel(event, upload_manager, "Список аккаунтов устарел. Запустите загрузку заново.")
+                            return
+                        sanitized_ids.append(snapshot.session_id)
+                        resolved_snapshots.append(snapshot)
+                    target_ids = sanitized_ids
+
+                enriched_groups: list[dict[str, object]] = []
+                for group in parsed_groups:
+                    chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
+                    enriched_groups.append(_serialize_group(group, chat_id, is_member))
+
+                unique_groups = deduplicate_broadcast_groups(enriched_groups)
+                groups_stats = {
+                    "file_rows": len(enriched_groups),
+                    "unique_groups": len(unique_groups),
+                }
+                account_stats: dict[str, dict[str, object]] = {}
+                for snapshot in resolved_snapshots:
+                    stats_for_account = dict(groups_stats)
+                    session_obj = snapshot.cached_session
+                    if session_obj is None:
+                        try:
+                            session_obj = await context.session_repository.get_by_session_id(snapshot.session_id)
+                        except Exception:
+                            logger.exception(
+                                "Не удалось загрузить данные аккаунта при расчёте групп",
+                                extra={"user_id": user_id, "session_id": snapshot.session_id},
+                            )
+                            session_obj = None
+                        else:
+                            snapshot.cached_session = session_obj
+                    actual_targets = len(unique_groups)
+                    if session_obj is not None and unique_groups:
+                        session_client = None
+                        try:
+                            session_client = await context.session_manager.build_client_from_session(session_obj)
+                            peer_keys = await collect_unique_target_peer_keys(
+                                session_client,
+                                unique_groups,
+                                user_id=user_id,
+                                account_label=snapshot.label,
+                                account_session_id=session_obj.session_id,
+                            )
+                            actual_targets = len(peer_keys)
+                        except DialogsFetchError as exc:
+                            logger.warning(
+                                "Не удалось проверить список чатов при загрузке групп",
+                                extra={"user_id": user_id, "session_id": snapshot.session_id, "reason": exc.error_type},
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Ошибка при расчёте фактических групп при загрузке",
+                                extra={"user_id": user_id, "session_id": snapshot.session_id},
+                            )
+                        finally:
+                            if session_client is not None:
+                                try:
+                                    await context.session_manager.close_client(session_client)
+                                except Exception:
+                                    logger.exception(
+                                        "Не удалось закрыть клиент после расчёта фактических групп",
+                                        extra={"session_id": snapshot.session_id},
+                                    )
+                    stats_for_account["actual_targets"] = actual_targets
+                    account_stats[snapshot.session_id] = stats_for_account
+                for session_id in target_ids:
+                    if session_id not in account_stats:
+                        stats_fallback = dict(groups_stats)
+                        stats_fallback["actual_targets"] = len(unique_groups)
+                        account_stats[session_id] = stats_fallback
+
+                snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
+                operation_scope = state.scope
+                try:
+                    if operation_scope == GroupUploadScope.ALL:
+                        updated = 0
+                        for session_id in target_ids:
+                            snapshot = snapshot_lookup.get(session_id)
+                            stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                            success = await context.session_repository.set_broadcast_groups(
+                                session_id,
+                                enriched_groups,
+                                owner_id=user_id,
+                                unique_groups=unique_groups,
+                                stats=stats_for_account,
+                            )
+                            if not success:
+                                label = snapshot.label if snapshot else session_id
+                                raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                            updated += 1
+                        if updated != len(target_ids):
+                            raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
+                        upload_manager.reset_targets(user_id)
+                    else:
+                        session_id = target_ids[0]
+                        stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                        success = await context.session_repository.set_broadcast_groups(
+                            session_id,
+                            enriched_groups,
+                            owner_id=user_id,
+                            unique_groups=unique_groups,
+                            stats=stats_for_account,
+                        )
+                        if not success:
+                            raise RuntimeError("Не удалось обновить выбранный аккаунт")
+                except Exception:
+                    logger.exception(
+                        "Ошибка при сохранении списка групп (Google Sheets)",
+                        extra={"user_id": user_id, "scope": state.scope.value, "targets": target_ids},
+                    )
+                    await status_msg.edit(
+                        "Не удалось сохранить список групп. Попробуйте позже или отправьте «Отмена»."
+                    )
+                    return
+
+                if operation_scope == GroupUploadScope.ALL:
+                    success_text = "Список групп для рассылки успешно загружен для всех подключённых аккаунтов."
+                else:
+                    snapshot = resolved_snapshots[0] if resolved_snapshots else None
+                    label = snapshot.label if snapshot else "выбранного аккаунта"
+                    success_text = f"Список групп для аккаунта {label} успешно обновлён."
+
+                success_text = f"{success_text}\n\n{DEDUP_NOTICE}"
+
+                upload_manager.neutralize(user_id)
+                upload_manager.clear(user_id)
+                await status_msg.edit(success_text)
+                await event.respond("Готово.", buttons=build_main_menu_keyboard())
+
+                # Persist sheet link state for monitor (per target account)
+                try:
+                    spreadsheet_id, gid = gs_parse_link(message_text)
+                except Exception:
+                    spreadsheet_id, gid = "", ""
+                if spreadsheet_id:
+                    try:
+                        from src.db.repositories.group_sheet_repository import GroupSheetRepository  # local import
+                        sheet_repo: GroupSheetRepository | None = getattr(context, "group_sheet_repository", None)
+                        if sheet_repo is not None:
+                            import hashlib, datetime
+                            content_hash = hashlib.sha256()
+                            for g in parsed_groups:
+                                content_hash.update(f"{g.name or ''}|{g.username or ''}|{g.link or ''}\n".encode("utf-8"))
+                            digest = content_hash.hexdigest()
+                            now = datetime.datetime.utcnow()
+                            for snapshot in resolved_snapshots:
+                                try:
+                                    await sheet_repo.upsert_link(
+                                        session_id=snapshot.session_id,
+                                        owner_id=user_id,
+                                        url=message_text,
+                                        spreadsheet_id=spreadsheet_id,
+                                        gid=gid,
+                                        content_hash=digest,
+                                        last_sync_ts=now,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Не удалось сохранить ссылку на таблицу",
+                                        extra={"user_id": user_id, "session_id": snapshot.session_id},
+                                    )
+                    except Exception:
+                        logger.debug("Sheet link persistence failed", exc_info=True)
+                return
+
+            # Not a Google Sheets link; prompt again
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Пожалуйста, отправьте Excel-файл формата .xlsx или .xls, либо напишите «Отмена».",
+                "Пожалуйста, отправьте Excel-файл формата .xlsx или .xls, пришлите ссылку на Google Таблицу (просмотр по ссылке), либо напишите «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -925,7 +1209,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         if extension not in ALLOWED_EXTENSIONS:
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Формат файла не поддерживается. Отправьте Excel-файл (.xlsx или .xls) или напишите «Отмена».",
+                "Формат файла не поддерживается. Отправьте Excel-файл (.xlsx или .xls) или пришлите ссылку на Google Таблицу (просмотр по ссылке), либо напишите «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -936,7 +1220,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             logger.exception("Не удалось скачать файл со списком групп", extra={"user_id": user_id})
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Не удалось скачать файл. Попробуйте ещё раз или отправьте «Отмена».",
+                "Не удалось скачать файл. Попробуйте ещё раз, пришлите ссылку на Google Таблицу или отправьте «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -947,7 +1231,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             logger.exception("Ошибка при чтении Excel с группами", extra={"user_id": user_id})
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Не удалось прочитать файл. Убедитесь, что это корректный Excel (.xlsx или .xls).",
+                "Не удалось прочитать файл. Убедитесь, что это корректный Excel (.xlsx или .xls), либо пришлите ссылку на Google Таблицу.",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -955,7 +1239,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         if not parsed_groups:
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Файл не содержит строк со списком групп. Заполните хотя бы одно поле в каждой строке.",
+                "Файл не содержит строк со списком групп. Заполните хотя бы одно поле в каждой строке или пришлите ссылку на таблицу.",
                 buttons=_build_file_prompt_buttons(),
             )
             return

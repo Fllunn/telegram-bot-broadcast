@@ -12,10 +12,12 @@ from src.db.client import MongoManager
 from src.db.repositories.account_repository import AccountRepository
 from src.db.repositories.auto_broadcast_task_repository import AutoBroadcastTaskRepository
 from src.db.repositories.session_repository import SessionRepository
+from src.db.repositories.group_sheet_repository import GroupSheetRepository
 from src.db.repositories.user_repository import UserRepository
 from src.services.auto_broadcast import AutoBroadcastService
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.account_status import AccountStatusService
+from src.services.sheet_monitor import GroupSheetMonitorService
 
 
 @dataclass(slots=True)
@@ -35,12 +37,14 @@ class Application:
 
             user_repository = UserRepository(database, collection_name=self.settings.user_collection)
             session_repository = SessionRepository(database, collection_name=self.settings.session_collection)
+            group_sheet_repository = GroupSheetRepository(database)
             task_repository = AutoBroadcastTaskRepository(database, collection_name=self.settings.auto_task_collection)
             account_repository = AccountRepository(database, collection_name=self.settings.auto_account_collection)
 
             # Ensure indexes before serving requests.
             await user_repository.ensure_indexes()
             await session_repository.ensure_indexes()
+            await group_sheet_repository.ensure_indexes()
             await task_repository.ensure_indexes()
             await account_repository.ensure_indexes()
 
@@ -73,17 +77,29 @@ class Application:
                 account_status_service=account_status_service,
             )
 
+            group_sheet_monitor = GroupSheetMonitorService(
+                repository=group_sheet_repository,
+                session_repository=session_repository,
+                bot_client=self.bot_application.client,
+                interval_seconds=600.0,
+            )
+
             await self.bot_application.start(
                 user_repository=user_repository,
                 session_repository=session_repository,
                 session_manager=telethon_manager,
                 auto_broadcast_service=auto_broadcast_service,
                 account_status_service=account_status_service,
+                group_sheet_repository=group_sheet_repository,
+                group_sheet_monitor=group_sheet_monitor,
             )
             stack.push_async_callback(self.bot_application.stop)
 
             await auto_broadcast_service.start()
             stack.push_async_callback(auto_broadcast_service.stop)
+
+            # Stop monitor service on exit
+            stack.push_async_callback(group_sheet_monitor.stop)
 
             await self.bot_application.idle()
 

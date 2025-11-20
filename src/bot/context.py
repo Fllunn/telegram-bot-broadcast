@@ -10,6 +10,8 @@ from src.services.account_status import AccountStatusService
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStateManager
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
+from src.db.repositories.group_sheet_repository import GroupSheetRepository
+from src.services.sheet_monitor import GroupSheetMonitorService
 
 
 @dataclass(slots=True)
@@ -26,3 +28,5 @@ class BotContext:
     group_view_manager: GroupViewStateManager
     auto_broadcast_service: AutoBroadcastService
     account_status_service: AccountStatusService
+    group_sheet_repository: GroupSheetRepository | None = None
+    group_sheet_monitor: GroupSheetMonitorService | None = None

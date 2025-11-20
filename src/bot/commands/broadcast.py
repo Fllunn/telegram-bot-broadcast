@@ -41,6 +41,7 @@ from src.services.broadcast_state import (
 )
 from src.services.broadcast_shared import (
 	BroadcastImageData as SharedBroadcastImageData,
+	BroadcastSendResult,
 	DialogsFetchError,
 	ResolvedGroupTarget as SharedResolvedGroupTarget,
 	deduplicate_broadcast_groups,
@@ -965,8 +966,8 @@ async def _send_payload_to_group(
 	group_label: str,
 	content_type: str,
 	extra_log_context: Optional[Mapping[str, Any]] = None,
-) -> tuple[bool, str | None]:
-	result, reason = await send_payload_to_group(
+) -> BroadcastSendResult:
+	return await send_payload_to_group(
 		session_client,
 		entity,
 		text,
@@ -979,7 +980,6 @@ async def _send_payload_to_group(
 		content_type=content_type,
 		extra_log_context=extra_log_context,
 	)
-	return result, reason
 
 
 async def _execute_broadcast_plan(
@@ -1269,7 +1269,7 @@ async def _execute_broadcast_plan(
 							break
 
 						current_chat_label = target.label
-						result, reason = await _send_payload_to_group(
+						send_result = await _send_payload_to_group(
 							session_client,
 							target.entity,
 							entry.text,
@@ -1283,7 +1283,7 @@ async def _execute_broadcast_plan(
 							extra_log_context=target.log_context,
 						)
 						processed += 1
-						if result:
+						if send_result.success:
 							success += 1
 							local_status = (
 								status_message
@@ -1298,21 +1298,21 @@ async def _execute_broadcast_plan(
 								user_id=user_id,
 								account_label=current_account_label,
 								account_session_id=entry.session.session_id,
-								reason=reason,
+								reason=send_result.final_error,
 								**_extract_group_log_context(target.group),
 							)
-							if reason and reason in AUTH_ERROR_NAMES:
-								label = await _handle_session_inactive(entry.session, f"send:{reason}")
+							if send_result.final_error and send_result.final_error in AUTH_ERROR_NAMES:
+								label = await _handle_session_inactive(entry.session, f"send:{send_result.final_error}")
 								session_inactive = True
 								await _update_progress(f"Аккаунт {label} стал неактивным, пропускаем")
 								break
-							local_status = f"Ошибка: {reason or 'неизвестная ошибка'}"
+							local_status = f"Ошибка: {send_result.final_error or 'неизвестная ошибка'}"
 
 						status_for_progress = local_status
 						if duplicates_message and not duplicate_status_sent:
 							status_for_progress = (
 								duplicates_message
-								if result
+								if send_result.success
 								else f"{duplicates_message}\n{local_status}"
 							)
 							duplicate_status_sent = True

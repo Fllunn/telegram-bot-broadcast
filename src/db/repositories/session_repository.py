@@ -218,7 +218,8 @@ class SessionRepository:
                     "metadata.broadcast_groups_unique": unique_payload,
                     "metadata.broadcast_groups_stats": stats_payload,
                     "updated_at": datetime.utcnow(),
-                }
+                },
+                "$inc": {"metadata.broadcast_groups_version": 1},
             },
         )
         return update.matched_count > 0
@@ -251,7 +252,38 @@ class SessionRepository:
                     "metadata.broadcast_groups_unique": unique_payload,
                     "metadata.broadcast_groups_stats": stats_payload,
                     "updated_at": datetime.utcnow(),
-                }
+                },
+                "$inc": {"metadata.broadcast_groups_version": 1},
             },
         )
         return result.matched_count or 0
+
+    async def get_broadcast_groups_with_version(
+        self,
+        session_id: str,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        doc = await self._collection.find_one(
+            {"session_id": session_id},
+            {
+                "_id": 0,
+                "metadata.broadcast_groups": 1,
+                "metadata.broadcast_groups_unique": 1,
+                "metadata.broadcast_groups_version": 1,
+            },
+        )
+        if not doc:
+            return 0, []
+        metadata = doc.get("metadata") or {}
+        version = metadata.get("broadcast_groups_version") or 0
+        groups = metadata.get("broadcast_groups_unique") or metadata.get("broadcast_groups") or []
+        if not isinstance(groups, list):
+            groups = []
+        normalized: list[dict[str, Any]] = []
+        for g in groups:
+            if isinstance(g, Mapping):
+                normalized.append(dict(g))
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            version = 0
+        return version, normalized
