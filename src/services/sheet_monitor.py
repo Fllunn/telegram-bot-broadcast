@@ -18,7 +18,7 @@ from src.services.google_sheets import (
     fetch_rows_from_link,
     parse_google_sheets_link,
 )
-from src.services.broadcast_shared import deduplicate_broadcast_groups
+from src.services.broadcast_shared import deduplicate_broadcast_groups, collect_unique_target_peer_keys_fast
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -184,23 +184,29 @@ class GroupSheetMonitorService:
             # No changes
             return
 
-        # Enrich and deduplicate similar to manual upload pipeline
+        # Enrich and deduplicate similar to manual upload pipeline (optimized version)
         enriched: list[dict] = []
         # Local import for functions to avoid circular import at module level
         from src.bot.commands import groups as groups_cmd  # type: ignore
 
+        # Don't verify access during background monitoring - just serialize groups
         for g in parsed_groups:
-            try:
-                chat_id, is_member = await groups_cmd._resolve_chat_id(self._bot_client, g.username, g.link)  # noqa: SLF001
-            except Exception:
-                chat_id, is_member = None, None
-            enriched.append(groups_cmd._serialize_group(g, chat_id, is_member))  # noqa: SLF001
+            enriched.append(groups_cmd._serialize_group(g, None, None))  # noqa: SLF001
 
         unique_groups = deduplicate_broadcast_groups(enriched)
+        
+        # Fast calculation of actual targets without access verification
+        try:
+            peer_keys = await collect_unique_target_peer_keys_fast(unique_groups)
+            actual_targets = len(peer_keys)
+        except Exception:
+            logger.debug("Error calculating actual targets", exc_info=True)
+            actual_targets = len(unique_groups)
+        
         stats = {
             "file_rows": len(enriched),
             "unique_groups": len(unique_groups),
-            "actual_targets": len(unique_groups),
+            "actual_targets": actual_targets,
         }
         try:
             success = await self._session_repository.set_broadcast_groups(

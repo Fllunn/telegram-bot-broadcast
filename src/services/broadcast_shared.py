@@ -24,10 +24,7 @@ from telethon.tl import types as tl_types
 
 logger = logging.getLogger(__name__)
 
-_KEY_INFO_PREFIXES: tuple[str, ...] = (
-    "Рассылка запущена",
-    "Рассылка завершена",
-)
+_KEY_INFO_PREFIXES: tuple[str, ...] = ()
 
 _MEDIA_ERROR_KEYWORDS: Tuple[str, ...] = (
     "MEDIA",
@@ -367,6 +364,61 @@ def resolved_target_identity(target: ResolvedGroupTarget) -> tuple[str, object |
     return _resolved_target_identity(target)
 
 
+def _extract_group_identity_key(group: Mapping[str, object]) -> Optional[tuple[str, object | tuple]]:
+    """Extract identity key from group without verification. Used for fast group loading.
+    
+    Returns None if group identity cannot be determined.
+    """
+    chat_id = group.get("chat_id")
+    parsed_id: Optional[int] = None
+    if isinstance(chat_id, int):
+        parsed_id = chat_id
+    elif isinstance(chat_id, str) and chat_id.strip():
+        try:
+            parsed_id = int(chat_id)
+        except (TypeError, ValueError):
+            parsed_id = None
+    
+    if parsed_id is not None:
+        return ("chat_id", parsed_id)
+    
+    username = sanitize_username_value(group.get("username"))
+    if username:
+        return ("username", username)
+    
+    identifier = extract_identifier_from_link_value(group.get("link"))
+    if identifier:
+        return ("username", identifier)
+    
+    group_name_value = str(group.get("name") or "").strip()
+    if group_name_value:
+        normalized = group_name_value.casefold()
+        return ("label", normalized)
+    
+    return None
+
+
+async def collect_unique_target_peer_keys_fast(
+    groups: Sequence[Mapping[str, object]],
+) -> Set[tuple[str, object | tuple]]:
+    """Fast collection of unique group identities without access verification.
+    
+    Used during group upload to quickly save groups without checking membership.
+    This is much faster for large group lists.
+    """
+    if not groups:
+        return set()
+    
+    peer_keys: Set[tuple[str, object | tuple]] = set()
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        identity_key = _extract_group_identity_key(group)
+        if identity_key is not None:
+            peer_keys.add(identity_key)
+    return peer_keys
+
+
 async def collect_unique_target_peer_keys(
     client,
     groups: Sequence[Mapping[str, object]],
@@ -640,7 +692,7 @@ async def resolve_group_targets(
                 **base_context,
             )
 
-    log_broadcast_event(logging.WARNING, "Не удалось подтвердить доступ к чату", **base_context)
+    log_broadcast_event(logging.DEBUG, "Не удалось разрешить группу по предоставленным данным", **base_context)
     return [], None
 
 
@@ -890,8 +942,8 @@ async def _send_payload_once(
         return BroadcastAttemptOutcome(False, exc.__class__.__name__, exc)
     except ChatWriteForbiddenError as exc:
         log_broadcast_event(
-            logging.ERROR,
-            f"Нет прав на отправку в чат ({exc.__class__.__name__})",
+            logging.DEBUG,
+            f"Нет доступа для отправки в чат ({exc.__class__.__name__})",
             error=str(exc),
             error_type=exc.__class__.__name__,
             **context,
@@ -899,8 +951,8 @@ async def _send_payload_once(
         return BroadcastAttemptOutcome(False, "нет прав на отправку", exc)
     except RPCError as rpc_error:
         log_broadcast_event(
-            logging.ERROR,
-            f"Ошибка RPC при отправке сообщения ({rpc_error.__class__.__name__})",
+            logging.DEBUG,
+            f"Ошибка RPC при отправке ({rpc_error.__class__.__name__})",
             error=str(rpc_error),
             error_type=rpc_error.__class__.__name__,
             **context,
@@ -1025,6 +1077,7 @@ __all__ = [
     "log_broadcast_event",
     "deduplicate_broadcast_groups",
     "collect_unique_target_peer_keys",
+    "collect_unique_target_peer_keys_fast",
     "_log_broadcast",
     "_render_group_label",
     "_extract_group_log_context",

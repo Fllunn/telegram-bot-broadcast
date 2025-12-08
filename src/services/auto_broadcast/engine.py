@@ -814,16 +814,6 @@ class AutoBroadcastService:
             group_payloads = self._metadata_groups(metadata_mapping)
             prepared: List[GroupTarget] = []
             for target in self.build_group_targets(group_payloads):
-                if isinstance(target.metadata, Mapping) and target.metadata.get("is_member") is False:
-                    logger.debug(
-                        "Skipping group marked as inaccessible",
-                        extra={
-                            "session_id": session.session_id,
-                            "user_id": session.owner_id,
-                            "group": target.metadata,
-                        },
-                    )
-                    continue
                 if self._is_valid_group(target):
                     prepared.append(target)
             if group_payloads and not prepared:

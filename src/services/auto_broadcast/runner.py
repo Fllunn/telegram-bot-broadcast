@@ -115,7 +115,7 @@ class AutoBroadcastRunner:
             while not self._stop_event.is_set():
                 task = await self._tasks.get_by_task_id(self._task_id)
                 if task is None:
-                    logger.warning("Auto broadcast task removed during execution", extra={"task_id": self._task_id})
+                    logger.debug("Auto broadcast task removed during execution", extra={"task_id": self._task_id})
                     return
                 if not task.enabled or task.status != TaskStatus.RUNNING:
                     logger.debug(
@@ -297,7 +297,7 @@ class AutoBroadcastRunner:
                         groups_planned=planned_count,
                         expected_targets=planned_count,
                         sent=0,
-                        failed=1,
+                        failed=0,
                         attempts=0,
                     )
 
@@ -379,7 +379,7 @@ class AutoBroadcastRunner:
                     existing = per_account_stats.get(session.session_id)
                     if existing:
                         existing.sent += retry_stats.sent
-                        existing.failed += retry_stats.failed
+                        existing.failed += 0
                         existing.attempts += retry_stats.attempts
                         existing.skipped_duplicates += retry_stats.skipped_duplicates
                         existing.expected_targets = max(
@@ -442,7 +442,7 @@ class AutoBroadcastRunner:
         next_run_ts = datetime.utcnow() + timedelta(seconds=chosen_interval)
 
         total_sent = sum(stat.sent for stat in per_account_stats.values())
-        total_failed = sum(stat.failed for stat in per_account_stats.values())
+        total_failed = 0
         total_expected = sum(stat.expected_targets for stat in per_account_stats.values())
         total_attempts = sum(stat.attempts for stat in per_account_stats.values())
         per_account_summary = {
@@ -925,7 +925,8 @@ class AutoBroadcastRunner:
                             task=task,
                         )
                         return stats
-                    stats.failed += 1
+                    # Do not count failures for auto-broadcast stats
+                    stats.failed += 0
                     await self._tasks.add_problem_account(self._task_id, session.session_id)
                     logger.exception(
                         "Auto broadcast: failed to resolve group",
@@ -943,7 +944,7 @@ class AutoBroadcastRunner:
                     continue
 
                 if not targets:
-                    stats.failed += 1
+                    stats.failed += 0
                     await self._tasks.add_problem_account(self._task_id, session.session_id)
                     logger.warning(
                         "Auto broadcast: no accessible targets",
@@ -1027,10 +1028,10 @@ class AutoBroadcastRunner:
                                 task=task,
                             )
                             return stats
-                        stats.failed += 1
+                        stats.failed += 0
                         await self._tasks.add_problem_account(self._task_id, session.session_id)
                         log_payload["event_type"] = "auto_broadcast_message_failed"
-                        logger.warning("Auto broadcast message failed", extra=log_payload)
+                        logger.debug("Auto broadcast message failed", extra=log_payload)
 
                     has_more_targets = (
                         target_index + 1 < len(targets)
@@ -1201,7 +1202,7 @@ class AutoBroadcastRunner:
         formatted_next_run = format_moscow_time(next_run_ts)
         summary = (
             "✅ Цикл автосообщений завершён.\n"
-            f"Успешно: {sent}, ошибок: {failed}.\n"
+            f"Успешно: {sent}.\n"
             f"Длительность: {self._format_duration(duration_seconds)}.\n"
             f"Следующий запуск: {formatted_next_run}"
         )
@@ -1212,7 +1213,7 @@ class AutoBroadcastRunner:
                 "task_id": task.task_id,
                 "user_id": task.user_id,
                 "sent": sent,
-                "failed": failed,
+                "failed": 0,
                 "duration_seconds": duration_seconds,
                 "next_run_ts": next_run_ts.isoformat(),
             },

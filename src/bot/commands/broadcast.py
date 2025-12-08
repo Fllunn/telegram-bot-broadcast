@@ -791,21 +791,7 @@ async def _build_broadcast_plan(
 			account_session_id=session.session_id,
 		)
 		valid_groups: list[Mapping[str, object]] = []
-		skipped_group_labels: list[str] = []
 		for group in all_groups:
-			member_flag = group.get("is_member") if isinstance(group, Mapping) else None
-			if member_flag is False:
-				label = _render_group_label(group)
-				skipped_group_labels.append(label)
-				_log_broadcast(
-					logging.DEBUG,
-					"Пропускаем чат: нет доступа",
-					user_id=user_id,
-					account_label=_render_session_label(session),
-					account_session_id=session.session_id,
-					**_extract_group_log_context(group),
-				)
-				continue
 			valid_groups.append(dict(group))
 		unique_groups = deduplicate_broadcast_groups(valid_groups)
 		stats_payload = metadata.get("broadcast_groups_stats") if isinstance(metadata, Mapping) else None
@@ -846,32 +832,17 @@ async def _build_broadcast_plan(
 			session_errors.append(
 				f"Для аккаунта {account_label} нет текста или картинки для рассылки. Добавьте материалы через /add_text или /add_image."
 			)
+		
+		# Skip access verification during plan preparation - will check during send
 		peer_keys: Set[tuple[str, object | tuple]] = set()
 		if not session_errors and unique_groups:
+			# Use fast identity extraction without verification
+			from src.services.broadcast_shared import collect_unique_target_peer_keys_fast
 			try:
-				peer_keys = await _calculate_actual_target_peers(
-					context,
-					session,
-					unique_groups,
-					user_id=user_id,
-					account_label=account_label,
-					content_type=content_type,
-				)
-			except DialogsFetchError as exc:
-				session_errors.append(
-					f"Не удалось проверить список чатов для аккаунта {account_label}. Попробуйте позже."
-				)
-				_log_broadcast(
-					logging.ERROR,
-					"Не удалось проверить список чатов для аккаунта",
-					user_id=user_id,
-					account_label=account_label,
-					account_session_id=session.session_id,
-					reason=exc.error_type,
-				)
+				peer_keys = await collect_unique_target_peer_keys_fast(unique_groups)
 			except Exception:
 				logger.exception(
-					"Не удалось рассчитать фактическое количество целевых чатов",
+					"Ошибка при расчёте идентификаторов групп",
 					extra={"session_id": session.session_id, "user_id": user_id},
 				)
 		if not peer_keys and unique_groups and not session_errors:
@@ -1293,8 +1264,8 @@ async def _execute_broadcast_plan(
 						else:
 							failed += 1
 							_log_broadcast(
-								logging.ERROR,
-								"Ошибка при отправке сообщения в чат",
+								logging.DEBUG,
+								"Ошибка при отправке в чат",
 								user_id=user_id,
 								account_label=current_account_label,
 								account_session_id=entry.session.session_id,

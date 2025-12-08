@@ -30,6 +30,7 @@ from src.models.session import TelethonSession
 from src.services.broadcast_shared import (
     DialogsFetchError,
     collect_unique_target_peer_keys,
+    collect_unique_target_peer_keys_fast,
     deduplicate_broadcast_groups,
 )
 from src.services.groups_state import (
@@ -443,6 +444,25 @@ def _serialize_group(group: ParsedGroup, chat_id: Optional[int], is_member: Opti
         "chat_id": chat_id,
         "is_member": is_member,
     }
+
+
+def _get_progress_update_interval(total_groups: int) -> int:
+    """Calculate progress update interval based on total group count.
+    
+    Returns interval at which to send progress updates:
+    - Every 20 for < 100 groups
+    - Every 100 for < 1000 groups  
+    - Every 500 for < 10000 groups
+    - Every 1000+ groups
+    """
+    if total_groups < 100:
+        return 20
+    elif total_groups < 1000:
+        return 100
+    elif total_groups < 10000:
+        return 500
+    else:
+        return 1000
 
 
 def _extract_groups(metadata: Optional[Mapping[str, object]]) -> List[Mapping[str, object]]:
@@ -1037,69 +1057,46 @@ def setup_group_commands(client, context: BotContext) -> None:
                         resolved_snapshots.append(snapshot)
                     target_ids = sanitized_ids
 
+                # Process groups with progress updates for Google Sheets too
                 enriched_groups: list[dict[str, object]] = []
-                for group in parsed_groups:
+                total_groups = len(parsed_groups)
+                progress_interval = _get_progress_update_interval(total_groups)
+                
+                for idx, group in enumerate(parsed_groups, 1):
                     chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
                     enriched_groups.append(_serialize_group(group, chat_id, is_member))
+                    
+                    # Show progress for large files
+                    if total_groups > progress_interval and idx % progress_interval == 0:
+                        try:
+                            await status_msg.edit(f"Обработано {idx}/{total_groups} групп из таблицы...")
+                        except Exception:
+                            pass  # Ignore edit errors
 
                 unique_groups = deduplicate_broadcast_groups(enriched_groups)
                 groups_stats = {
                     "file_rows": len(enriched_groups),
                     "unique_groups": len(unique_groups),
                 }
+                
+                # Fast calculation of actual targets without access verification during upload
+                try:
+                    peer_keys = await collect_unique_target_peer_keys_fast(unique_groups)
+                    actual_targets = len(peer_keys)
+                except Exception:
+                    logger.exception("Ошибка при расчёте фактических групп", extra={"user_id": user_id})
+                    actual_targets = len(unique_groups)
+                
+                # Use the same stats for all accounts
                 account_stats: dict[str, dict[str, object]] = {}
                 for snapshot in resolved_snapshots:
                     stats_for_account = dict(groups_stats)
-                    session_obj = snapshot.cached_session
-                    if session_obj is None:
-                        try:
-                            session_obj = await context.session_repository.get_by_session_id(snapshot.session_id)
-                        except Exception:
-                            logger.exception(
-                                "Не удалось загрузить данные аккаунта при расчёте групп",
-                                extra={"user_id": user_id, "session_id": snapshot.session_id},
-                            )
-                            session_obj = None
-                        else:
-                            snapshot.cached_session = session_obj
-                    actual_targets = len(unique_groups)
-                    if session_obj is not None and unique_groups:
-                        session_client = None
-                        try:
-                            session_client = await context.session_manager.build_client_from_session(session_obj)
-                            peer_keys = await collect_unique_target_peer_keys(
-                                session_client,
-                                unique_groups,
-                                user_id=user_id,
-                                account_label=snapshot.label,
-                                account_session_id=session_obj.session_id,
-                            )
-                            actual_targets = len(peer_keys)
-                        except DialogsFetchError as exc:
-                            logger.warning(
-                                "Не удалось проверить список чатов при загрузке групп",
-                                extra={"user_id": user_id, "session_id": snapshot.session_id, "reason": exc.error_type},
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Ошибка при расчёте фактических групп при загрузке",
-                                extra={"user_id": user_id, "session_id": snapshot.session_id},
-                            )
-                        finally:
-                            if session_client is not None:
-                                try:
-                                    await context.session_manager.close_client(session_client)
-                                except Exception:
-                                    logger.exception(
-                                        "Не удалось закрыть клиент после расчёта фактических групп",
-                                        extra={"session_id": snapshot.session_id},
-                                    )
                     stats_for_account["actual_targets"] = actual_targets
                     account_stats[snapshot.session_id] = stats_for_account
                 for session_id in target_ids:
                     if session_id not in account_stats:
                         stats_fallback = dict(groups_stats)
-                        stats_fallback["actual_targets"] = len(unique_groups)
+                        stats_fallback["actual_targets"] = actual_targets
                         account_stats[session_id] = stats_fallback
 
                 snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
@@ -1153,7 +1150,9 @@ def setup_group_commands(client, context: BotContext) -> None:
                     label = snapshot.label if snapshot else "выбранного аккаунта"
                     success_text = f"Список групп для аккаунта {label} успешно обновлён."
 
-                success_text = f"{success_text}\n\n{DEDUP_NOTICE}"
+                # Add detailed stats to success message
+                stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+                success_text = f"{success_text}\n\n{stats_detail}\n\n{DEDUP_NOTICE}"
 
                 upload_manager.neutralize(user_id)
                 upload_manager.clear(user_id)
@@ -1288,69 +1287,47 @@ def setup_group_commands(client, context: BotContext) -> None:
                 resolved_snapshots.append(snapshot)
             target_ids = sanitized_ids
 
+        # Process groups with progress updates
+        status_msg = await event.respond("Обрабатываю группы, подождите...")
         enriched_groups: list[dict[str, object]] = []
-        for group in parsed_groups:
+        total_groups = len(parsed_groups)
+        progress_interval = _get_progress_update_interval(total_groups)
+        
+        for idx, group in enumerate(parsed_groups, 1):
             chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
             enriched_groups.append(_serialize_group(group, chat_id, is_member))
+            
+            # Show progress for large files
+            if total_groups > progress_interval and idx % progress_interval == 0:
+                try:
+                    await status_msg.edit(f"Обработано {idx}/{total_groups} групп...")
+                except Exception:
+                    pass  # Ignore edit errors
 
         unique_groups = deduplicate_broadcast_groups(enriched_groups)
         groups_stats = {
             "file_rows": len(enriched_groups),
             "unique_groups": len(unique_groups),
         }
+        
+        # Fast calculation of actual targets without access verification during upload
+        try:
+            peer_keys = await collect_unique_target_peer_keys_fast(unique_groups)
+            actual_targets = len(peer_keys)
+        except Exception:
+            logger.exception("Ошибка при расчёте фактических групп", extra={"user_id": user_id})
+            actual_targets = len(unique_groups)
+        
+        # Use the same stats for all accounts
         account_stats: dict[str, dict[str, object]] = {}
         for snapshot in resolved_snapshots:
             stats_for_account = dict(groups_stats)
-            session_obj = snapshot.cached_session
-            if session_obj is None:
-                try:
-                    session_obj = await context.session_repository.get_by_session_id(snapshot.session_id)
-                except Exception:
-                    logger.exception(
-                        "Не удалось загрузить данные аккаунта при расчёте групп",
-                        extra={"user_id": user_id, "session_id": snapshot.session_id},
-                    )
-                    session_obj = None
-                else:
-                    snapshot.cached_session = session_obj
-            actual_targets = len(unique_groups)
-            if session_obj is not None and unique_groups:
-                session_client = None
-                try:
-                    session_client = await context.session_manager.build_client_from_session(session_obj)
-                    peer_keys = await collect_unique_target_peer_keys(
-                        session_client,
-                        unique_groups,
-                        user_id=user_id,
-                        account_label=snapshot.label,
-                        account_session_id=session_obj.session_id,
-                    )
-                    actual_targets = len(peer_keys)
-                except DialogsFetchError as exc:
-                    logger.warning(
-                        "Не удалось проверить список чатов при загрузке групп",
-                        extra={"user_id": user_id, "session_id": snapshot.session_id, "reason": exc.error_type},
-                    )
-                except Exception:
-                    logger.exception(
-                        "Ошибка при расчёте фактических групп при загрузке",
-                        extra={"user_id": user_id, "session_id": snapshot.session_id},
-                    )
-                finally:
-                    if session_client is not None:
-                        try:
-                            await context.session_manager.close_client(session_client)
-                        except Exception:
-                            logger.exception(
-                                "Не удалось закрыть клиент после расчёта фактических групп",
-                                extra={"session_id": snapshot.session_id},
-                            )
             stats_for_account["actual_targets"] = actual_targets
             account_stats[snapshot.session_id] = stats_for_account
         for session_id in target_ids:
             if session_id not in account_stats:
                 stats_fallback = dict(groups_stats)
-                stats_fallback["actual_targets"] = len(unique_groups)
+                stats_fallback["actual_targets"] = actual_targets
                 account_stats[session_id] = stats_fallback
 
         snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
@@ -1406,7 +1383,9 @@ def setup_group_commands(client, context: BotContext) -> None:
             label = snapshot.label if snapshot else "выбранного аккаунта"
             success_text = f"Список групп для аккаунта {label} успешно обновлён."
 
-        success_text = f"{success_text}\n\n{DEDUP_NOTICE}"
+        # Add detailed stats to success message
+        stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+        success_text = f"{success_text}\n\n{stats_detail}\n\n{DEDUP_NOTICE}"
 
         total_actual_targets = 0
         for stats_payload in account_stats.values():
@@ -1415,7 +1394,7 @@ def setup_group_commands(client, context: BotContext) -> None:
                 total_actual_targets += int(value)
             except (TypeError, ValueError):
                 total_actual_targets += len(unique_groups)
-        logger.info(
+        logger.debug(
             "Список групп обновлён",
             extra={
                 "user_id": user_id,

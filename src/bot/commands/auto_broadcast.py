@@ -34,6 +34,7 @@ from src.services.auto_broadcast.state_manager import (
 from src.services.broadcast_shared import (
     DialogsFetchError,
     collect_unique_target_peer_keys,
+    collect_unique_target_peer_keys_fast,
     deduplicate_broadcast_groups,
     describe_content_payload,
 )
@@ -234,43 +235,16 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
     ) -> int:
         if not groups:
             return 0
-        session_client = None
         try:
-            session_client = await context.session_manager.build_client_from_session(session)
-            peer_keys = await collect_unique_target_peer_keys(
-                session_client,
-                groups,
-                user_id=user_id,
-                account_label=account_label,
-                account_session_id=session.session_id,
-                content_type=content_type,
-            )
+            # Use fast identity extraction without verification
+            peer_keys = await collect_unique_target_peer_keys_fast(groups)
             return len(peer_keys)
-        except DialogsFetchError as exc:
-            logger.warning(
-                "Не удалось проверить список чатов при подготовке авторассылки",
-                extra={
-                    "user_id": user_id,
-                    "session_id": session.session_id,
-                    "reason": exc.error_type,
-                },
-            )
-            return fallback
         except Exception:
             logger.exception(
-                "Не удалось рассчитать фактические целевые чаты для авторассылки",
+                "Ошибка при расчёте идентификаторов групп для авторассылки",
                 extra={"session_id": session.session_id, "user_id": user_id},
             )
             return fallback
-        finally:
-            if session_client is not None:
-                try:
-                    await context.session_manager.close_client(session_client)
-                except Exception:
-                    logger.exception(
-                        "Не удалось закрыть клиент Telethon после расчёта целевых групп",
-                        extra={"session_id": session.session_id},
-                    )
 
     def _stop_menu_buttons() -> List[List[Button]]:
         return [
@@ -342,19 +316,6 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
                 if not normalized:
                     continue
                 candidate = normalized[0]
-                if isinstance(candidate.metadata, Mapping) and candidate.metadata.get("is_member") is False:
-                    logger.warning(
-                        "Skipping group for auto-task setup: no membership",
-                        extra={
-                            "user_id": event.sender_id,
-                            "session_id": session.session_id,
-                            "group_metadata": candidate.metadata,
-                            "group_username": candidate.username,
-                            "group_chat_id": candidate.chat_id,
-                            "group_link": candidate.link,
-                        },
-                    )
-                    continue
                 if not service.is_valid_group(candidate):
                     continue
                 candidate.source_session_id = session.session_id
@@ -676,7 +637,7 @@ def setup_auto_broadcast_commands(client, context: BotContext) -> None:
             if remaining > 0:
                 display = f"{display} +{remaining}"
             account_line = f"Аккаунты: {display}"
-        stats_line = f"Статистика: {task.total_sent} отправлено, {task.total_failed} ошибок"
+        stats_line = f"Статистика: {task.total_sent} отправлено"
         return "\n".join(
             [
                 f"{icon} {status_text}",
