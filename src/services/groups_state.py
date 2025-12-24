@@ -25,6 +25,7 @@ class GroupUploadStep(str, Enum):
     IDLE = "idle"
     CHOOSING_SCOPE = "choosing_scope"
     CHOOSING_ACCOUNT = "choosing_account"
+    CHOOSING_MODE = "choosing_mode"
     CONFIRMING_REPLACE = "confirming_replace"
     WAITING_FILE = "waiting_file"
 
@@ -34,6 +35,13 @@ class GroupUploadScope(str, Enum):
 
     SINGLE = "single"
     ALL = "all"
+
+
+class GroupUploadMode(str, Enum):
+    """Determines whether to replace all groups or append to existing ones."""
+
+    REPLACE = "replace"
+    APPEND = "append"
 
 
 def _generate_flow_token() -> str:
@@ -47,6 +55,7 @@ class GroupUploadSession:
     flow_id: str = field(default_factory=_generate_flow_token)
     step: GroupUploadStep = GroupUploadStep.IDLE
     scope: GroupUploadScope = GroupUploadScope.SINGLE
+    upload_mode: GroupUploadMode = GroupUploadMode.REPLACE
     target_session_ids: List[str] = field(default_factory=list)
     selected_session_id: Optional[str] = None
     last_message_id: Optional[int] = None

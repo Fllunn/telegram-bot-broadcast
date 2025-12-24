@@ -34,6 +34,7 @@ from src.services.broadcast_shared import (
     deduplicate_broadcast_groups,
 )
 from src.services.groups_state import (
+    GroupUploadMode,
     GroupUploadScope,
     GroupUploadStateManager,
     GroupUploadStep,
@@ -52,6 +53,9 @@ VIEW_GROUPS_PATTERN = rf"^(?:/view_groups(?:@\w+)?|{re.escape(VIEW_GROUPS_LABEL)
 UPLOAD_SCOPE_PREFIX = "groups_scope"
 UPLOAD_SCOPE_SINGLE = "single"
 UPLOAD_SCOPE_ALL = "all"
+UPLOAD_MODE_PREFIX = "groups_mode"
+UPLOAD_MODE_REPLACE = "replace"
+UPLOAD_MODE_APPEND = "append"
 SELECT_PREFIX = "groups_select"
 CONFIRM_PREFIX = "groups_confirm"
 CANCEL_PREFIX = "groups_cancel"
@@ -195,6 +199,30 @@ def _build_upload_scope_buttons(flow_id: str) -> list[list[Button]]:
             Button.inline(
                 "❌ Отмена",
                 f"{CANCEL_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:scope".encode("utf-8"),
+            )
+        ],
+    ]
+
+
+def _build_upload_mode_buttons(flow_id: str) -> list[list[Button]]:
+    """Build buttons for choosing upload mode: replace all or append to existing."""
+    return [
+        [
+            Button.inline(
+                "Заменить все группы",
+                f"{UPLOAD_MODE_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_MODE_REPLACE}".encode("utf-8"),
+            ),
+        ],
+        [
+            Button.inline(
+                "Добавить к существующим",
+                f"{UPLOAD_MODE_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:{UPLOAD_MODE_APPEND}".encode("utf-8"),
+            ),
+        ],
+        [
+            Button.inline(
+                "❌ Отмена",
+                f"{CANCEL_PREFIX}:{PAYLOAD_VERSION}:{flow_id}:mode".encode("utf-8"),
             )
         ],
     ]
@@ -370,6 +398,94 @@ def _parse_rows_to_groups(rows: List[List[object]]) -> List[ParsedGroup]:
             continue
         parsed.append(ParsedGroup(name=name or None, username=username or None, link=link or None))
     return parsed
+
+
+def _parse_text_links(text: str) -> Optional[List[ParsedGroup]]:
+    """Parse newline-separated links from plain text message.
+    
+    Returns:
+        List of ParsedGroup objects if text contains valid links, None otherwise.
+    """
+    if not text or not text.strip():
+        return None
+    
+    lines = text.strip().split('\n')
+    parsed_groups: List[ParsedGroup] = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Try to extract username or link
+        username_candidate = _extract_username_candidate(line)
+        identifier = _extract_identifier_from_link(line)
+        
+        # Check if it's a valid Telegram link or username
+        if identifier:
+            # It's a link
+            normalized_link = f"https://t.me/{identifier}"
+            parsed_groups.append(ParsedGroup(name=None, username=None, link=normalized_link))
+        elif username_candidate:
+            # It's a username
+            parsed_groups.append(ParsedGroup(name=None, username=username_candidate, link=None))
+        else:
+            # Invalid format
+            return None
+    
+    # Return None if no valid groups found
+    return parsed_groups if parsed_groups else None
+
+
+def _merge_groups_for_append(existing_groups: List[dict[str, object]], new_groups: List[dict[str, object]]) -> List[dict[str, object]]:
+    """Merge new groups with existing groups, removing duplicates based on chat_id or link/username.
+    
+    Returns:
+        Merged list of unique groups.
+    """
+    # Create a set to track unique groups by chat_id, link, or username
+    seen_identifiers = set()
+    merged_groups = []
+    
+    # First, add all existing groups
+    for group in existing_groups:
+        chat_id = group.get('chat_id')
+        link = group.get('link')
+        username = group.get('username')
+        
+        # Create identifier for uniqueness check
+        identifier = None
+        if chat_id:
+            identifier = ('chat_id', chat_id)
+        elif link:
+            identifier = ('link', link.lower().strip())
+        elif username:
+            identifier = ('username', username.lower().strip())
+        
+        if identifier and identifier not in seen_identifiers:
+            seen_identifiers.add(identifier)
+            merged_groups.append(group)
+    
+    # Then add new groups, skipping duplicates
+    for group in new_groups:
+        chat_id = group.get('chat_id')
+        link = group.get('link')
+        username = group.get('username')
+        
+        # Create identifier for uniqueness check
+        identifier = None
+        if chat_id:
+            identifier = ('chat_id', chat_id)
+        elif link:
+            identifier = ('link', link.lower().strip())
+        elif username:
+            identifier = ('username', username.lower().strip())
+        
+        if identifier and identifier not in seen_identifiers:
+            seen_identifiers.add(identifier)
+            merged_groups.append(group)
+    
+    return merged_groups
 
 
 
@@ -780,22 +896,12 @@ def setup_group_commands(client, context: BotContext) -> None:
             session_ids = [session.session_id for session in sessions]
             upload_manager.reset_targets(user_id)
             upload_manager.set_all_targets(user_id, session_ids)
-            has_existing = any(
-                snapshot.cached_session is not None and _extract_groups(snapshot.cached_session.metadata)
-                for snapshot in sessions
+            # After selecting "all accounts", ask about upload mode
+            upload_manager.update(user_id, step=GroupUploadStep.CHOOSING_MODE)
+            message = await event.edit(
+                "Хотите заменить все существующие группы или добавить к ним новые?",
+                buttons=_build_upload_mode_buttons(state.flow_id),
             )
-            if has_existing:
-                upload_manager.update(user_id, step=GroupUploadStep.CONFIRMING_REPLACE)
-                message = await event.edit(
-                    "В некоторых аккаунтах уже есть список групп. Заменить его для всех аккаунтов?",
-                    buttons=_build_upload_confirmation_buttons(state.flow_id, GroupUploadScope.ALL),
-                )
-            else:
-                upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
-                message = await event.edit(
-                    "Отправьте Excel-файл (.xlsx или .xls) со списком групп или пришлите ссылку на Google Таблицу, открытую по ссылке (просмотр). Первая строка может быть заголовком.",
-                    buttons=_build_file_prompt_buttons(),
-                )
             upload_manager.update(user_id, last_message_id=message.id)
             return
 
@@ -848,24 +954,58 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
         state = updated_state
 
-        session_obj = snapshot.cached_session
-        existing = _extract_groups(session_obj.metadata) if session_obj is not None else []
-        if existing:
-            token = upload_manager.register_confirmation_token(user_id, session_id)
-            if not token:
-                await event.answer("Не удалось подготовить подтверждение. Повторите попытку.", alert=True)
-                return
-            upload_manager.update(user_id, step=GroupUploadStep.CONFIRMING_REPLACE)
-            message = await event.edit(
-                "Для выбранного аккаунта уже есть список групп. Заменить его?",
-                buttons=_build_upload_confirmation_buttons(state.flow_id, GroupUploadScope.SINGLE, token),
-            )
+        # After selecting account, ask about upload mode
+        upload_manager.update(user_id, step=GroupUploadStep.CHOOSING_MODE)
+        message = await event.edit(
+            "Хотите заменить все существующие группы или добавить к ним новые?",
+            buttons=_build_upload_mode_buttons(state.flow_id),
+        )
+        upload_manager.update(user_id, last_message_id=message.id)
+
+    @client.on(events.CallbackQuery(pattern=rf"^{UPLOAD_MODE_PREFIX}:".encode("utf-8")))
+    async def handle_upload_mode_selection(event: events.CallbackQuery.Event) -> None:
+        """Handle selection of upload mode: replace all or append to existing groups."""
+        user_id = event.sender_id
+        state = upload_manager.get(user_id)
+        if state is None or state.step != GroupUploadStep.CHOOSING_MODE:
+            await event.answer("Эта операция больше неактуальна.", alert=True)
+            return
+
+        parsed = _parse_callback_payload(event.data, UPLOAD_MODE_PREFIX)
+        if parsed is None:
+            await event.answer("Некорректный запрос.", alert=True)
+            return
+
+        flow_id, parts = parsed
+        if not parts:
+            await event.answer("Некорректный выбор.", alert=True)
+            return
+        selection = parts[0]
+
+        if flow_id != state.flow_id:
+            await event.answer("Сценарий загрузки устарел. Запустите /upload_groups заново.", alert=True)
+            return
+
+        # Set the upload mode
+        if selection == UPLOAD_MODE_REPLACE:
+            upload_manager.update(user_id, upload_mode=GroupUploadMode.REPLACE)
+        elif selection == UPLOAD_MODE_APPEND:
+            upload_manager.update(user_id, upload_mode=GroupUploadMode.APPEND)
         else:
-            upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
-            message = await event.edit(
-                "Отправьте Excel-файл (.xlsx или .xls) со списком групп или пришлите ссылку на Google Таблицу, открытую по ссылке (просмотр). Первая строка может быть заголовком.",
-                buttons=_build_file_prompt_buttons(),
-            )
+            await event.answer("Некорректный выбор.", alert=True)
+            return
+
+        # Move to waiting for file
+        upload_manager.update(user_id, step=GroupUploadStep.WAITING_FILE)
+        message = await event.edit(
+            "Отправьте Excel-файл (.xlsx или .xls) со списком групп, пришлите ссылку на Google Таблицу (просмотр по ссылке), или отправьте текстовое сообщение со ссылками (по одной на строке).\n\n"
+            "Пример текстового сообщения:\n"
+            "https://t.me/group1\n"
+            "@username2\n"
+            "t.me/group3\n\n"
+            "Первая строка в файле может быть заголовком.",
+            buttons=_build_file_prompt_buttons(),
+        )
         upload_manager.update(user_id, last_message_id=message.id)
 
     @client.on(events.CallbackQuery(pattern=rf"^{CONFIRM_PREFIX}:".encode("utf-8")))
@@ -968,7 +1108,212 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
 
         document = event.document
-        # New: allow Google Sheets link as an alternative to file
+        
+        # Check if it's a text message with links (not Google Sheets and no file)
+        if document is None and message_text and not gs_is_link(message_text):
+            # Try to parse as text links
+            parsed_text_groups = _parse_text_links(message_text)
+            if parsed_text_groups is not None:
+                # Valid text links found, process them
+                upload_manager.update(user_id, last_message_id=event.id)
+                status_msg = await event.respond("Обрабатываю группы из текста, подождите...")
+                
+                state = upload_manager.get(user_id)
+                if state is None:
+                    logger.warning("Состояние загрузки групп потеряно", extra={"user_id": user_id})
+                    await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
+                    return
+
+                target_ids = list(state.target_session_ids or [])
+                resolved_snapshots: list[UploadAccountSnapshot] = []
+
+                if state.scope == GroupUploadScope.SINGLE:
+                    selected_id = getattr(state, "selected_session_id", None)
+                    if not selected_id:
+                        logger.warning("Нет выбранного аккаунта при загрузке текстовых ссылок", extra={"user_id": user_id})
+                        await _handle_cancel(event, upload_manager, "Аккаунт не выбран. Запустите загрузку заново.")
+                        return
+                    state, snapshot = await _ensure_upload_snapshot(user_id, state, selected_id, ensure_cached=True)
+                    if snapshot is None:
+                        logger.warning(
+                            "Не удалось подтвердить выбранный аккаунт при загрузке текстовых ссылок",
+                            extra={"user_id": user_id, "session_id": selected_id},
+                        )
+                        await _handle_cancel(event, upload_manager, "Выбор аккаунта устарел. Запустите загрузку заново.")
+                        return
+                    target_ids = [snapshot.session_id]
+                    resolved_snapshots.append(snapshot)
+                else:
+                    if not target_ids:
+                        logger.warning("Нет целевых аккаунтов для сохранения групп", extra={"user_id": user_id})
+                        await _handle_cancel(event, upload_manager, "Не удалось определить целевые аккаунты. Попробуйте снова.")
+                        return
+                    sanitized_ids: list[str] = []
+                    for session_id in target_ids:
+                        state, snapshot = await _ensure_upload_snapshot(user_id, state, session_id, ensure_cached=True)
+                        if snapshot is None:
+                            logger.warning(
+                                "Целевой аккаунт недоступен при загрузке текстовых ссылок",
+                                extra={"user_id": user_id, "session_id": session_id},
+                            )
+                            await _handle_cancel(event, upload_manager, "Список аккаунтов устарел. Запустите загрузку заново.")
+                            return
+                        sanitized_ids.append(snapshot.session_id)
+                        resolved_snapshots.append(snapshot)
+                    target_ids = sanitized_ids
+
+                # Process groups with progress updates
+                enriched_groups: list[dict[str, object]] = []
+                total_groups = len(parsed_text_groups)
+                progress_interval = _get_progress_update_interval(total_groups)
+                
+                for idx, group in enumerate(parsed_text_groups, 1):
+                    chat_id, is_member = await _resolve_chat_id(event.client, group.username, group.link)
+                    enriched_groups.append(_serialize_group(group, chat_id, is_member))
+                    
+                    # Show progress for large lists
+                    if total_groups > progress_interval and idx % progress_interval == 0:
+                        try:
+                            await status_msg.edit(f"Обработано {idx}/{total_groups} групп из текста...")
+                        except Exception:
+                            pass
+
+                # Get upload mode from state
+                upload_mode = getattr(state, 'upload_mode', GroupUploadMode.REPLACE)
+                
+                # If append mode, merge with existing groups
+                if upload_mode == GroupUploadMode.APPEND:
+                    for snapshot in resolved_snapshots:
+                        if snapshot.cached_session and snapshot.cached_session.metadata:
+                            existing_groups = _extract_groups(snapshot.cached_session.metadata)
+                            if existing_groups:
+                                enriched_groups = _merge_groups_for_append(existing_groups, enriched_groups)
+                    # After merging, recalculate unique groups
+                
+                unique_groups = deduplicate_broadcast_groups(enriched_groups)
+                groups_stats = {
+                    "file_rows": len(enriched_groups),
+                    "unique_groups": len(unique_groups),
+                }
+                
+                # Fast calculation of actual targets
+                try:
+                    peer_keys = await collect_unique_target_peer_keys_fast(unique_groups)
+                    actual_targets = len(peer_keys)
+                except Exception:
+                    logger.exception("Ошибка при расчёте фактических групп", extra={"user_id": user_id})
+                    actual_targets = len(unique_groups)
+                
+                # Use the same stats for all accounts
+                account_stats: dict[str, dict[str, object]] = {}
+                for snapshot in resolved_snapshots:
+                    stats_for_account = dict(groups_stats)
+                    stats_for_account["actual_targets"] = actual_targets
+                    account_stats[snapshot.session_id] = stats_for_account
+                for session_id in target_ids:
+                    if session_id not in account_stats:
+                        stats_fallback = dict(groups_stats)
+                        stats_fallback["actual_targets"] = actual_targets
+                        account_stats[session_id] = stats_fallback
+
+                snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
+                operation_scope = state.scope
+                try:
+                    if operation_scope == GroupUploadScope.ALL:
+                        updated = 0
+                        for session_id in target_ids:
+                            snapshot = snapshot_lookup.get(session_id)
+                            stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                            
+                            # For append mode, merge with existing groups for this specific session
+                            groups_to_save = enriched_groups
+                            if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                                existing = _extract_groups(snapshot.cached_session.metadata)
+                                if existing:
+                                    groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                                    # Recalculate stats for this account
+                                    unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                                    stats_for_account = {
+                                        "file_rows": len(groups_to_save),
+                                        "unique_groups": len(unique_for_account),
+                                        "actual_targets": len(unique_for_account),
+                                    }
+                            
+                            success = await context.session_repository.set_broadcast_groups(
+                                session_id,
+                                groups_to_save,
+                                owner_id=user_id,
+                                unique_groups=deduplicate_broadcast_groups(groups_to_save),
+                                stats=stats_for_account,
+                            )
+                            if not success:
+                                label = snapshot.label if snapshot else session_id
+                                raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                            updated += 1
+                        if updated != len(target_ids):
+                            raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
+                        upload_manager.reset_targets(user_id)
+                    else:
+                        session_id = target_ids[0]
+                        snapshot = resolved_snapshots[0] if resolved_snapshots else None
+                        stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                        
+                        # For append mode, merge with existing groups
+                        groups_to_save = enriched_groups
+                        if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                            existing = _extract_groups(snapshot.cached_session.metadata)
+                            if existing:
+                                groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                                # Recalculate stats
+                                unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                                stats_for_account = {
+                                    "file_rows": len(groups_to_save),
+                                    "unique_groups": len(unique_for_account),
+                                    "actual_targets": len(unique_for_account),
+                                }
+                        
+                        success = await context.session_repository.set_broadcast_groups(
+                            session_id,
+                            groups_to_save,
+                            owner_id=user_id,
+                            unique_groups=deduplicate_broadcast_groups(groups_to_save),
+                            stats=stats_for_account,
+                        )
+                        if not success:
+                            raise RuntimeError("Не удалось обновить выбранный аккаунт")
+                except Exception:
+                    logger.exception(
+                        "Ошибка при сохранении списка групп (текстовые ссылки)",
+                        extra={"user_id": user_id, "scope": state.scope.value, "targets": target_ids},
+                    )
+                    await status_msg.edit(
+                        "Не удалось сохранить список групп. Попробуйте позже или отправьте «Отмена»."
+                    )
+                    return
+
+                if operation_scope == GroupUploadScope.ALL:
+                    success_text = f"Список групп {'обновлён' if upload_mode == GroupUploadMode.APPEND else 'загружен'} для всех подключённых аккаунтов."
+                else:
+                    snapshot = resolved_snapshots[0] if resolved_snapshots else None
+                    label = snapshot.label if snapshot else "выбранного аккаунта"
+                    mode_text = "обновлён (добавлены новые)" if upload_mode == GroupUploadMode.APPEND else "заменён"
+                    success_text = f"Список групп для аккаунта {label} {mode_text}."
+
+                # Add detailed stats
+                stats_detail = f"📊 {'Добавлено' if upload_mode == GroupUploadMode.APPEND else 'Загружено'}: {len([g for g in enriched_groups if g])} строк → {len(unique_groups)} уникальных групп"
+                if upload_mode == GroupUploadMode.APPEND:
+                    # Count total groups after merge
+                    total_after_merge = len(enriched_groups)
+                    stats_detail = f"📊 Добавлено уникальных: {len(unique_groups)} групп. Всего групп в базе: {total_after_merge}"
+                success_text = f"{success_text}\n\n{stats_detail}\n\n{DEDUP_NOTICE}"
+
+                upload_manager.neutralize(user_id)
+                upload_manager.clear(user_id)
+                await status_msg.edit(success_text)
+                await event.respond("Готово.", buttons=build_main_menu_keyboard())
+                return
+        
+        # If not a Google Sheets link and not valid text links
         if document is None:
             if message_text and gs_is_link(message_text):
                 # Process Google Sheets
@@ -1101,17 +1446,34 @@ def setup_group_commands(client, context: BotContext) -> None:
 
                 snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
                 operation_scope = state.scope
+                upload_mode = getattr(state, 'upload_mode', GroupUploadMode.REPLACE)
+                
                 try:
                     if operation_scope == GroupUploadScope.ALL:
                         updated = 0
                         for session_id in target_ids:
                             snapshot = snapshot_lookup.get(session_id)
                             stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                            
+                            # For append mode, merge with existing groups
+                            groups_to_save = enriched_groups
+                            if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                                existing = _extract_groups(snapshot.cached_session.metadata)
+                                if existing:
+                                    groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                                    # Recalculate stats for this account
+                                    unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                                    stats_for_account = {
+                                        "file_rows": len(groups_to_save),
+                                        "unique_groups": len(unique_for_account),
+                                        "actual_targets": len(unique_for_account),
+                                    }
+                            
                             success = await context.session_repository.set_broadcast_groups(
                                 session_id,
-                                enriched_groups,
+                                groups_to_save,
                                 owner_id=user_id,
-                                unique_groups=unique_groups,
+                                unique_groups=deduplicate_broadcast_groups(groups_to_save),
                                 stats=stats_for_account,
                             )
                             if not success:
@@ -1123,12 +1485,28 @@ def setup_group_commands(client, context: BotContext) -> None:
                         upload_manager.reset_targets(user_id)
                     else:
                         session_id = target_ids[0]
+                        snapshot = resolved_snapshots[0] if resolved_snapshots else None
                         stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                        
+                        # For append mode, merge with existing groups
+                        groups_to_save = enriched_groups
+                        if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                            existing = _extract_groups(snapshot.cached_session.metadata)
+                            if existing:
+                                groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                                # Recalculate stats
+                                unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                                stats_for_account = {
+                                    "file_rows": len(groups_to_save),
+                                    "unique_groups": len(unique_for_account),
+                                    "actual_targets": len(unique_for_account),
+                                }
+                        
                         success = await context.session_repository.set_broadcast_groups(
                             session_id,
-                            enriched_groups,
+                            groups_to_save,
                             owner_id=user_id,
-                            unique_groups=unique_groups,
+                            unique_groups=deduplicate_broadcast_groups(groups_to_save),
                             stats=stats_for_account,
                         )
                         if not success:
@@ -1144,14 +1522,20 @@ def setup_group_commands(client, context: BotContext) -> None:
                     return
 
                 if operation_scope == GroupUploadScope.ALL:
-                    success_text = "Список групп для рассылки успешно загружен для всех подключённых аккаунтов."
+                    mode_text = "обновлён (добавлены новые группы)" if upload_mode == GroupUploadMode.APPEND else "загружен"
+                    success_text = f"Список групп для рассылки успешно {mode_text} для всех подключённых аккаунтов."
                 else:
                     snapshot = resolved_snapshots[0] if resolved_snapshots else None
                     label = snapshot.label if snapshot else "выбранного аккаунта"
-                    success_text = f"Список групп для аккаунта {label} успешно обновлён."
+                    mode_text = "обновлён (добавлены новые)" if upload_mode == GroupUploadMode.APPEND else "обновлён"
+                    success_text = f"Список групп для аккаунта {label} успешно {mode_text}."
 
                 # Add detailed stats to success message
-                stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+                if upload_mode == GroupUploadMode.APPEND:
+                    # For append mode, show how many new unique groups were added
+                    stats_detail = f"📊 Добавлено новых: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+                else:
+                    stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
                 success_text = f"{success_text}\n\n{stats_detail}\n\n{DEDUP_NOTICE}"
 
                 upload_manager.neutralize(user_id)
@@ -1198,7 +1582,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             # Not a Google Sheets link; prompt again
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Пожалуйста, отправьте Excel-файл формата .xlsx или .xls, пришлите ссылку на Google Таблицу (просмотр по ссылке), либо напишите «Отмена».",
+                "Пожалуйста, отправьте Excel-файл формата .xlsx или .xls, пришлите ссылку на Google Таблицу (просмотр по ссылке), или отправьте текстовое сообщение со ссылками на группы (по одной на строке), либо напишите «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -1208,7 +1592,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         if extension not in ALLOWED_EXTENSIONS:
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Формат файла не поддерживается. Отправьте Excel-файл (.xlsx или .xls) или пришлите ссылку на Google Таблицу (просмотр по ссылке), либо напишите «Отмена».",
+                "Формат файла не поддерживается. Отправьте Excel-файл (.xlsx или .xls), пришлите ссылку на Google Таблицу (просмотр по ссылке), или отправьте текстовое сообщение со ссылками на группы (по одной на строке), либо напишите «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -1219,7 +1603,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             logger.exception("Не удалось скачать файл со списком групп", extra={"user_id": user_id})
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Не удалось скачать файл. Попробуйте ещё раз, пришлите ссылку на Google Таблицу или отправьте «Отмена».",
+                "Не удалось скачать файл. Попробуйте ещё раз, пришлите ссылку на Google Таблицу, или отправьте текстовое сообщение со ссылками на группы (по одной на строке), либо напишите «Отмена».",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -1230,7 +1614,7 @@ def setup_group_commands(client, context: BotContext) -> None:
             logger.exception("Ошибка при чтении Excel с группами", extra={"user_id": user_id})
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Не удалось прочитать файл. Убедитесь, что это корректный Excel (.xlsx или .xls), либо пришлите ссылку на Google Таблицу.",
+                "Не удалось прочитать файл. Убедитесь, что это корректный Excel (.xlsx или .xls), или пришлите ссылку на Google Таблицу, либо отправьте текстовое сообщение со ссылками на группы (по одной на строке).",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -1238,7 +1622,7 @@ def setup_group_commands(client, context: BotContext) -> None:
         if not parsed_groups:
             upload_manager.update(user_id, last_message_id=event.id)
             await event.respond(
-                "Файл не содержит строк со списком групп. Заполните хотя бы одно поле в каждой строке или пришлите ссылку на таблицу.",
+                "Файл не содержит строк со списком групп. Заполните хотя бы одно поле в каждой строке, пришлите ссылку на таблицу, или отправьте текстовое сообщение со ссылками на группы (по одной на строке).",
                 buttons=_build_file_prompt_buttons(),
             )
             return
@@ -1332,17 +1716,34 @@ def setup_group_commands(client, context: BotContext) -> None:
 
         snapshot_lookup = {snapshot.session_id: snapshot for snapshot in resolved_snapshots}
         operation_scope = state.scope
+        upload_mode = getattr(state, 'upload_mode', GroupUploadMode.REPLACE)
+        
         try:
             if operation_scope == GroupUploadScope.ALL:
                 updated = 0
                 for session_id in target_ids:
                     snapshot = snapshot_lookup.get(session_id)
                     stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                    
+                    # For append mode, merge with existing groups
+                    groups_to_save = enriched_groups
+                    if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                        existing = _extract_groups(snapshot.cached_session.metadata)
+                        if existing:
+                            groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                            # Recalculate stats for this account
+                            unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                            stats_for_account = {
+                                "file_rows": len(groups_to_save),
+                                "unique_groups": len(unique_for_account),
+                                "actual_targets": len(unique_for_account),
+                            }
+                    
                     success = await context.session_repository.set_broadcast_groups(
                         session_id,
-                        enriched_groups,
+                        groups_to_save,
                         owner_id=user_id,
-                        unique_groups=unique_groups,
+                        unique_groups=deduplicate_broadcast_groups(groups_to_save),
                         stats=stats_for_account,
                     )
                     if not success:
@@ -1354,12 +1755,28 @@ def setup_group_commands(client, context: BotContext) -> None:
                 upload_manager.reset_targets(user_id)
             else:
                 session_id = target_ids[0]
+                snapshot = resolved_snapshots[0] if resolved_snapshots else None
                 stats_for_account = account_stats.get(session_id, dict(groups_stats))
+                
+                # For append mode, merge with existing groups
+                groups_to_save = enriched_groups
+                if upload_mode == GroupUploadMode.APPEND and snapshot and snapshot.cached_session:
+                    existing = _extract_groups(snapshot.cached_session.metadata)
+                    if existing:
+                        groups_to_save = _merge_groups_for_append(existing, enriched_groups)
+                        # Recalculate stats
+                        unique_for_account = deduplicate_broadcast_groups(groups_to_save)
+                        stats_for_account = {
+                            "file_rows": len(groups_to_save),
+                            "unique_groups": len(unique_for_account),
+                            "actual_targets": len(unique_for_account),
+                        }
+                
                 success = await context.session_repository.set_broadcast_groups(
                     session_id,
-                    enriched_groups,
+                    groups_to_save,
                     owner_id=user_id,
-                    unique_groups=unique_groups,
+                    unique_groups=deduplicate_broadcast_groups(groups_to_save),
                     stats=stats_for_account,
                 )
                 if not success:
@@ -1377,14 +1794,20 @@ def setup_group_commands(client, context: BotContext) -> None:
             return
 
         if operation_scope == GroupUploadScope.ALL:
-            success_text = "Список групп для рассылки успешно загружен для всех подключённых аккаунтов."
+            mode_text = "обновлён (добавлены новые группы)" if upload_mode == GroupUploadMode.APPEND else "загружен"
+            success_text = f"Список групп для рассылки успешно {mode_text} для всех подключённых аккаунтов."
         else:
             snapshot = resolved_snapshots[0] if resolved_snapshots else None
             label = snapshot.label if snapshot else "выбранного аккаунта"
-            success_text = f"Список групп для аккаунта {label} успешно обновлён."
+            mode_text = "обновлён (добавлены новые)" if upload_mode == GroupUploadMode.APPEND else "обновлён"
+            success_text = f"Список групп для аккаунта {label} успешно {mode_text}."
 
         # Add detailed stats to success message
-        stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+        if upload_mode == GroupUploadMode.APPEND:
+            # For append mode, show how many were added
+            stats_detail = f"📊 Добавлено новых: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
+        else:
+            stats_detail = f"📊 Загружено: {len(enriched_groups)} строк → {len(unique_groups)} уникальных групп"
         success_text = f"{success_text}\n\n{stats_detail}\n\n{DEDUP_NOTICE}"
 
         total_actual_targets = 0
