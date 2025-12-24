@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.user_repository import UserRepository
+from src.db.repositories.auto_invasion_repository import AutoInvasionRepository
 from src.services.auth_state import AuthStateManager
 from src.services.auto_broadcast import AutoBroadcastService
 from src.services.account_status import AccountStatusService
@@ -12,6 +13,7 @@ from src.services.broadcast_state import BroadcastRunStateManager, BroadcastStat
 from src.services.groups_state import GroupUploadStateManager, GroupViewStateManager
 from src.db.repositories.group_sheet_repository import GroupSheetRepository
 from src.services.sheet_monitor import GroupSheetMonitorService
+from src.services.auto_invasion.worker import AutoInvasionWorker
 
 
 @dataclass(slots=True)
@@ -30,3 +32,5 @@ class BotContext:
     account_status_service: AccountStatusService
     group_sheet_repository: GroupSheetRepository | None = None
     group_sheet_monitor: GroupSheetMonitorService | None = None
+    invasion_repository: AutoInvasionRepository | None = None
+    invasion_worker: AutoInvasionWorker | None = None

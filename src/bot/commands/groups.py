@@ -75,6 +75,22 @@ DEDUP_NOTICE = (
 )
 
 
+async def _sync_invasion_groups_if_active(
+    context: BotContext,
+    user_id: int,
+    session_id: str,
+    groups: list[dict],
+    *,
+    replace: bool = False,
+) -> None:
+    """Sync invasion_groups after broadcast_groups are updated.
+    
+    If `replace` is True, worker will reset join status for provided links to force re-check.
+    """
+    if context.invasion_worker and groups:
+        await context.invasion_worker.refresh_groups_for_session(user_id, session_id, groups, replace=replace)
+
+
 @dataclass(frozen=True)
 class ParsedGroup:
     name: Optional[str]
@@ -1249,6 +1265,13 @@ def setup_group_commands(client, context: BotContext) -> None:
                             if not success:
                                 label = snapshot.label if snapshot else session_id
                                 raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                            
+                            # Sync invasion_groups if auto-invasion is active
+                            await _sync_invasion_groups_if_active(
+                                context, user_id, session_id, groups_to_save,
+                                replace=(upload_mode != GroupUploadMode.APPEND),
+                            )
+                            
                             updated += 1
                         if updated != len(target_ids):
                             raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
@@ -1281,6 +1304,12 @@ def setup_group_commands(client, context: BotContext) -> None:
                         )
                         if not success:
                             raise RuntimeError("Не удалось обновить выбранный аккаунт")
+                        
+                        # Sync invasion_groups if auto-invasion is active
+                        await _sync_invasion_groups_if_active(
+                            context, user_id, session_id, groups_to_save,
+                            replace=(upload_mode != GroupUploadMode.APPEND),
+                        )
                 except Exception:
                     logger.exception(
                         "Ошибка при сохранении списка групп (текстовые ссылки)",
@@ -1479,6 +1508,13 @@ def setup_group_commands(client, context: BotContext) -> None:
                             if not success:
                                 label = snapshot.label if snapshot else session_id
                                 raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                            
+                            # Sync invasion_groups if auto-invasion is active
+                            await _sync_invasion_groups_if_active(
+                                context, user_id, session_id, groups_to_save,
+                                replace=(upload_mode != GroupUploadMode.APPEND),
+                            )
+                            
                             updated += 1
                         if updated != len(target_ids):
                             raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
@@ -1511,6 +1547,12 @@ def setup_group_commands(client, context: BotContext) -> None:
                         )
                         if not success:
                             raise RuntimeError("Не удалось обновить выбранный аккаунт")
+                        
+                        # Sync invasion_groups if auto-invasion is active
+                        await _sync_invasion_groups_if_active(
+                            context, user_id, session_id, groups_to_save,
+                            replace=(upload_mode != GroupUploadMode.APPEND),
+                        )
                 except Exception:
                     logger.exception(
                         "Ошибка при сохранении списка групп (Google Sheets)",
@@ -1749,6 +1791,13 @@ def setup_group_commands(client, context: BotContext) -> None:
                     if not success:
                         label = snapshot.label if snapshot else session_id
                         raise RuntimeError(f"Не удалось обновить аккаунт {label}")
+                    
+                    # Sync invasion_groups if auto-invasion is active
+                    await _sync_invasion_groups_if_active(
+                        context, user_id, session_id, groups_to_save,
+                        replace=(upload_mode != GroupUploadMode.APPEND),
+                    )
+                    
                     updated += 1
                 if updated != len(target_ids):
                     raise RuntimeError("Не все аккаунты подтвердили обновление списка групп")
@@ -1781,6 +1830,12 @@ def setup_group_commands(client, context: BotContext) -> None:
                 )
                 if not success:
                     raise RuntimeError("Не удалось обновить выбранный аккаунт")
+                
+                # Sync invasion_groups if auto-invasion is active
+                await _sync_invasion_groups_if_active(
+                    context, user_id, session_id, groups_to_save,
+                    replace=(upload_mode != GroupUploadMode.APPEND),
+                )
         except Exception:
             logger.exception(
                 "Ошибка при сохранении списка групп",

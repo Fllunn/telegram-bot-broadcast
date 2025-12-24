@@ -14,10 +14,13 @@ from src.db.repositories.auto_broadcast_task_repository import AutoBroadcastTask
 from src.db.repositories.session_repository import SessionRepository
 from src.db.repositories.group_sheet_repository import GroupSheetRepository
 from src.db.repositories.user_repository import UserRepository
+from src.db.repositories.auto_invasion_repository import AutoInvasionRepository
 from src.services.auto_broadcast import AutoBroadcastService
 from src.services.telethon_manager import TelethonSessionManager
 from src.services.account_status import AccountStatusService
 from src.services.sheet_monitor import GroupSheetMonitorService
+from src.services.auto_invasion.worker import AutoInvasionWorker
+from src.bot.commands.auto_invasion import set_worker_instance
 
 
 @dataclass(slots=True)
@@ -40,13 +43,14 @@ class Application:
             group_sheet_repository = GroupSheetRepository(database)
             task_repository = AutoBroadcastTaskRepository(database, collection_name=self.settings.auto_task_collection)
             account_repository = AccountRepository(database, collection_name=self.settings.auto_account_collection)
+            invasion_repository = AutoInvasionRepository(database)
 
-            # Ensure indexes before serving requests.
             await user_repository.ensure_indexes()
             await session_repository.ensure_indexes()
             await group_sheet_repository.ensure_indexes()
             await task_repository.ensure_indexes()
             await account_repository.ensure_indexes()
+            await invasion_repository.ensure_indexes()
 
             telethon_manager = TelethonSessionManager(
                 api_id=self.settings.telegram_api_id,
@@ -84,6 +88,13 @@ class Application:
                 interval_seconds=600.0,
             )
 
+            invasion_worker = AutoInvasionWorker(
+                invasion_repository=invasion_repository,
+                session_repository=session_repository,
+                session_manager=telethon_manager,
+            )
+            set_worker_instance(invasion_worker)
+
             await self.bot_application.start(
                 user_repository=user_repository,
                 session_repository=session_repository,
@@ -92,13 +103,17 @@ class Application:
                 account_status_service=account_status_service,
                 group_sheet_repository=group_sheet_repository,
                 group_sheet_monitor=group_sheet_monitor,
+                invasion_repository=invasion_repository,
+                invasion_worker=invasion_worker,
             )
             stack.push_async_callback(self.bot_application.stop)
 
             await auto_broadcast_service.start()
             stack.push_async_callback(auto_broadcast_service.stop)
 
-            # Stop monitor service on exit
+            await invasion_worker.start()
+            stack.push_async_callback(invasion_worker.stop)
+
             stack.push_async_callback(group_sheet_monitor.stop)
 
             await self.bot_application.idle()
