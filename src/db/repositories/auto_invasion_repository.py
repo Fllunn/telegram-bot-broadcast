@@ -205,3 +205,29 @@ class AutoInvasionRepository:
             })
         except Exception:
             pass
+
+    async def get_joined_groups(self, user_id: int) -> list[str]:
+        """Get list of all successfully joined group links for a user."""
+        cursor = self._groups.find(
+            {"user_id": user_id, "joined": True},
+            {"link": 1, "_id": 0}  # Projection: get only 'link' field, exclude '_id'
+        )
+        groups = []
+        async for doc in cursor:
+            link = doc.get("link")
+            if link:
+                groups.append(link)
+        return groups
+
+    async def get_pending_groups(self, user_id: int) -> list[str]:
+        """Get list of groups where join attempt failed or not yet attempted."""
+        cursor = self._groups.find(
+            {"user_id": user_id, "joined": False},
+            {"link": 1, "_id": 0}  # Projection: get only 'link' field, exclude '_id'
+        )
+        groups = []
+        async for doc in cursor:
+            link = doc.get("link")
+            if link:
+                groups.append(link)
+        return groups

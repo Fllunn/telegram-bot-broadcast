@@ -6,13 +6,23 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telethon import TelegramClient
-from telethon.errors import ChannelPrivateError, FloodWaitError, UserPrivacyRestrictedError
+from telethon.errors import (
+    ChannelPrivateError,
+    ChannelsTooMuchError,
+    FloodWaitError,
+    UserChannelsTooMuchError,
+    UserPrivacyRestrictedError,
+)
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 from src.db.repositories.auto_invasion_repository import AutoInvasionRepository
 from src.db.repositories.session_repository import SessionRepository
 from src.models.session import SessionOwnerType, TelethonSession
+from src.services.auto_invasion.backoff_calculator import (
+    get_between_joins_delay,
+    get_cycle_pause,
+)
 from src.services.auto_invasion.captcha_solver import solve_captcha
 from src.services.auto_invasion.link_parser import parse_group_link
 from src.services.telethon_manager import TelethonSessionManager
@@ -163,7 +173,8 @@ class AutoInvasionWorker:
             if not groups:
                 return
 
-            # Process groups until we actually join one (not just update DB for already-joined)
+            # Build list of unjoined groups with their normalized links
+            unjoined_groups = []
             for group in groups:
                 try:
                     link_key = self._normalize_group_link(group)
@@ -175,22 +186,90 @@ class AutoInvasionWorker:
                         session.session_id,
                         link_key,
                     )
-                    if is_joined:
-                        continue
-
-                    # Returns True if actually joined a new group, False if just updated DB
-                    actually_joined = await self._process_group(user_id, session, group, link_key)
-                    
-                    if actually_joined:
-                        # Actually joined a new group, stop and let main timer (1-3 min) run
-                        return
-                    else:
-                        # Just updated DB for already-joined group, small delay and continue
-                        await asyncio.sleep(random.uniform(3, 5))
-                        # Continue to next group
-                    
+                    if not is_joined:
+                        unjoined_groups.append((group, link_key))
                 except Exception:
                     continue
+
+            if not unjoined_groups:
+                return
+
+            # Process groups in cycles: 2-3 groups per cycle with 5-10 sec delays, then 15-20 min pause
+            groups_to_retry = unjoined_groups.copy()
+            
+            while self._running:
+                # If all groups processed, rebuild the list of unjoined groups
+                if not groups_to_retry:
+                    groups_to_retry = []
+                    for group in groups:
+                        try:
+                            link_key = self._normalize_group_link(group)
+                            if not link_key:
+                                continue
+
+                            is_joined = await self._invasion_repository.is_group_joined(
+                                user_id,
+                                session.session_id,
+                                link_key,
+                            )
+                            if not is_joined:
+                                groups_to_retry.append((group, link_key))
+                        except Exception:
+                            continue
+                    
+                    # If no groups left to retry, exit
+                    if not groups_to_retry:
+                        break
+                
+                # Pick 2-3 random groups for this cycle
+                cycle_size = min(random.randint(2, 3), len(groups_to_retry))
+                groups_in_cycle = groups_to_retry[:cycle_size]
+                
+                joined_count = 0
+                for group, link_key in groups_in_cycle:
+                    if not self._running:
+                        return
+                    
+                    try:
+                        # Double-check still unjoined
+                        is_joined = await self._invasion_repository.is_group_joined(
+                            user_id,
+                            session.session_id,
+                            link_key,
+                        )
+                        if is_joined:
+                            # Already joined, remove from retry list
+                            groups_to_retry = [g for g in groups_to_retry if g[1] != link_key]
+                            continue
+
+                        # Try to join this group
+                        actually_joined = await self._process_group(
+                            user_id,
+                            session,
+                            group,
+                            link_key,
+                        )
+                        
+                        if actually_joined:
+                            joined_count += 1
+                        
+                        # Remove from current retry list (will be re-checked in next full cycle if needed)
+                        groups_to_retry = [g for g in groups_to_retry if g[1] != link_key]
+                        
+                        # Delay before next join attempt (5-10 sec)
+                        if groups_in_cycle.index((group, link_key)) < len(groups_in_cycle) - 1:
+                            await asyncio.sleep(get_between_joins_delay())
+                    
+                    except Exception:
+                        # Error during join - remove from current list, will retry in next full cycle
+                        groups_to_retry = [g for g in groups_to_retry if g[1] != link_key]
+                        continue
+                
+                # After processing cycle, pause 15-20 minutes before next cycle
+                if self._running:
+                    pause_seconds = get_cycle_pause()
+                    await asyncio.sleep(pause_seconds)
+        
         except Exception:
             pass
 
@@ -210,8 +289,8 @@ class AutoInvasionWorker:
         """Process a group join attempt.
         
         Returns:
-            True if actually joined a new group (timer should run)
-            False if group was already joined (just updated DB, no timer needed)
+            True if actually joined a new group
+            False if couldn't join (already joined, error, etc.) - will be retried in next cycle
         """
         link = group.get("link")
         username = group.get("username")
@@ -247,12 +326,13 @@ class AutoInvasionWorker:
                     try:
                         participant = await client.get_permissions(entity)
                         if participant and not participant.is_banned:
-                            # Already a member, mark as joined and return False (no timer)
+                            # Already a member, mark as joined and return False
                             already_member = True
                     except Exception:
                         pass  # Not a member or can't check, proceed to join
             except Exception:
-                # Can't get entity - might be invalid link, mark as error and skip
+                # Can't get entity - invalid link, mark as joined to skip it in future
+                await self._invasion_repository.mark_joined(user_id, session.session_id, link_key)
                 return False
 
             if already_member:
@@ -274,11 +354,16 @@ class AutoInvasionWorker:
                 # Can't join this group, mark as joined to skip it in future
                 await self._invasion_repository.mark_joined(user_id, session.session_id, link_key)
                 return False
+            except (ChannelsTooMuchError, UserChannelsTooMuchError):
+                # Hit the limit of joined channels - pause for 15-25 minutes
+                pause_seconds = random.uniform(15 * 60, 25 * 60)
+                await asyncio.sleep(pause_seconds)
+                return False
             except FloodWaitError as error:
                 await asyncio.sleep(error.seconds + 10)
                 return False
             except Exception:
-                # Unknown error, skip for now but don't mark as joined
+                # Unknown error, skip for now but don't mark as joined (will retry in next cycle)
                 return False
 
             if not joined:

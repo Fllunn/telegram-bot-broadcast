@@ -31,3 +31,13 @@ def calculate_next_attempt(
 def calculate_long_pause(now: datetime) -> datetime:
     hours = random.uniform(24, 48)
     return now + timedelta(hours=hours)
+
+
+def get_between_joins_delay() -> float:
+    """Get random delay between join attempts in seconds (5-10 sec)."""
+    return random.uniform(5, 10)
+
+
+def get_cycle_pause() -> float:
+    """Get random pause after completing a cycle of joins in seconds (15-20 min)."""
+    return random.uniform(15 * 60, 20 * 60)
