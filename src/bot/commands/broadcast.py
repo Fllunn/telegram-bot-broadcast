@@ -724,6 +724,7 @@ async def _build_broadcast_plan(
 	seen_session_ids: set[str] = set()
 	session_candidates: list[TelethonSession] = []
 	session_labels: dict[str, str] = {}
+	skipped_group_labels: list[str] = []
 	for session_id in session_ids:
 		if not session_id or session_id in seen_session_ids:
 			continue
